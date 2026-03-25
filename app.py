@@ -17,7 +17,7 @@ from flask import Flask, request, redirect, jsonify
 app = Flask(__name__)
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
-DB_URL = os.getenv("DATABASE_URL")  
+DB_URL = os.getenv("DB_URL")  
 if DB_URL and DB_URL.startswith("postgres://"):
     DB_URL = DB_URL.replace("postgres://", "postgresql://", 1)
 
