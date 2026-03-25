@@ -1,15 +1,3 @@
-"""
-app.py — Gas bottle order management system.
-Run setup_db.py first, then: python app.py
-
-Endpoints:
-  GET  /lookup?phone=...   — Caller lookup (triggered by Vonage webhook)
-  GET  /search             — Browse all customers
-  GET  /order?phone=...    — Add order for a phone number
-  POST /save_order         — Submit order form
-  GET  /api/orders?phone=  — JSON order history
-"""
-
 from functools import wraps
 from dotenv import load_dotenv
 import os
@@ -45,17 +33,19 @@ def normalize_phone(phone):
         clean = '44' + clean
     return f"+{clean}" if clean else None
 
-
 def get_customer(phone):
     conn = get_db()
-    row = conn.execute("SELECT * FROM customers WHERE phone = %s", (phone,)).fetchone()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM customers WHERE phone = %s", (phone,))
+    row = cur.fetchone()
+    cur.close()
     conn.close()
     return dict(row) if row else None
 
-
 def get_orders(phone):
     conn = get_db()
-    cur = conn.execute('''
+    cur = conn.cursor()
+    cur.execute('''
         SELECT o.id, o.order_date, o.notes, p.name AS product, oi.quantity
         FROM orders o
         JOIN order_items oi ON o.id = oi.order_id
@@ -64,6 +54,7 @@ def get_orders(phone):
         ORDER BY o.order_date DESC, o.id DESC
     ''', (phone,))
     rows = cur.fetchall()
+    cur.close()
     conn.close()
 
     orders = {}
@@ -74,17 +65,21 @@ def get_orders(phone):
         orders[oid]["items"].append({"product": row["product"], "qty": row["quantity"]})
     return list(orders.values())
 
-
 def get_all_products():
     conn = get_db()
-    rows = conn.execute("SELECT * FROM products ORDER BY id").fetchall()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM products ORDER BY id")
+    rows = cur.fetchall()
+    cur.close()
     conn.close()
     return [dict(r) for r in rows]
 
-
 def get_all_customers():
     conn = get_db()
-    rows = conn.execute("SELECT * FROM customers ORDER BY name").fetchall()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM customers ORDER BY name")
+    rows = cur.fetchall()
+    cur.close()
     conn.close()
     return [dict(r) for r in rows]
 
@@ -449,13 +444,17 @@ def save_order():
         return redirect(f"/order?phone={phone}")
 
     conn = get_db()
+    cur = conn.cursor()
     if not get_customer(phone):
-        conn.execute("INSERT INTO customers (phone, name) VALUES (%s, %s)", (phone, "Unknown"))
-    cur  = conn.execute("INSERT INTO orders (phone, order_date) VALUES (%s, %s)", (phone, date))
-    oid  = cur.lastrowid
+        cur.execute("INSERT INTO customers (phone, name) VALUES (%s, %s)", (phone, "Unknown"))
+    cur.execute("INSERT INTO orders (phone, order_date) VALUES (%s, %s) RETURNING id", (phone, date))
+    oid = cur.fetchone()[0]
+
     for pid, qty in items.items():
-        conn.execute("INSERT INTO order_items (order_id, product_id, quantity) VALUES (%s, %s, %s)", (oid, int(pid), int(qty)))
+        cur.execute("INSERT INTO order_items (order_id, product_id, quantity) VALUES (%s, %s, %s)", (oid, int(pid), int(qty)))
+
     conn.commit()
+    cur.close()
     conn.close()
     return redirect(f"/lookup?phone={phone}")
 
@@ -551,19 +550,25 @@ def add_customer():
         postcode = request.form.get("postcode")
 
         conn = get_db()
-        conn.execute('''
-            INSERT OR REPLACE INTO customers (phone, name, address, town, postcode)
+        cur = conn.cursor()
+        cur.execute('''
+            INSERT INTO customers (phone, name, address, town, postcode)
             VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (phone) DO UPDATE
+            SET name = EXCLUDED.name,
+                address = EXCLUDED.address,
+                town = EXCLUDED.town,
+                postcode = EXCLUDED.postcode
         ''', (phone, name, address, town, postcode))
         conn.commit()
+        cur.close()
         conn.close()
 
         if "save_and_order" in request.form:
             return redirect(f"/order?phone={phone}")
-
         return redirect("/search")
 
-    body = '''
+    body = f'''
     <h1 style="margin-bottom:24px">Add Customer</h1>
     <div class="card">
       <form method="POST">
@@ -648,6 +653,6 @@ def api_orders():
 
 
 if __name__ == "__main__":
-    
+
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=True)
