@@ -55,14 +55,18 @@ def get_customer(phone):
     if not phone:
         return None
 
-    alt = phone.replace("+44", "0")
+    # normalize both +44 and 0 forms
+    phone_plus44 = normalize_phone(phone)
+    phone_zero  = None
+    if phone_plus44.startswith("+44"):
+        phone_zero = "0" + phone_plus44[3:]
 
     conn = get_db()
     cur = conn.cursor()
     cur.execute("""
         SELECT * FROM customers 
         WHERE phone = %s OR phone = %s
-    """, (phone, normalize_phone(alt)))
+    """, (phone_plus44, phone_zero))
     
     row = cur.fetchone()
     cur.close()
@@ -424,6 +428,30 @@ STYLE = """
   .order-item-tag { font-size: .78rem; font-weight: 600; background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 4px 10px; }
   .order-item-tag span { color: var(--accent); margin-left: 4px; }
 
+  .modern-input {
+      padding: 6px 12px;
+      border-radius: 6px;
+      border: 1px solid #ccc;
+      font-size: 14px;
+      outline: none;
+      transition: border-color 0.2s;
+  }
+
+  .modern-input:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 4px rgba(0,0,0,0.1);
+  }
+
+  .modern-table {
+      width: 100%;
+      border-collapse: collapse;
+  }
+
+  .modern-table th, .modern-table td {
+      border-bottom: 1px solid #eee;
+      padding: 8px 12px;
+  }
+
   input[type=text], input[type=date], input[type=tel] {
     background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
     color: var(--text); font-family: 'DM Mono', monospace; font-size: .85rem;
@@ -664,77 +692,6 @@ def delete_order():
 
     return redirect(f"/lookup?phone={phone}")
 
-@app.route("/order")
-@login_required
-def order_page():
-    phone_raw = request.args.get("phone", "")
-    phone     = normalize_phone(phone_raw) or phone_raw
-    products  = get_all_products()
-
-    tiles = ""
-    for p in products:
-        tiles += f'''<div class="product-tile" id="tile-{p["id"]}" onclick="addQty({p["id"]})">
-          <div class="p-name">{p["name"]}</div>
-          <div class="p-qty" id="qty-{p["id"]}"></div>
-          <span class="p-reset" onclick="event.stopPropagation();resetTile({p["id"]})">&#x2715; clear</span>
-        </div>'''
-
-    if phone:
-        phone_field = f'<input type="hidden" name="phone" value="{phone}">'
-        cancel_btn  = f'<a href="/lookup?phone={phone}" class="btn btn-ghost">Cancel</a>'
-        user = get_customer(phone)
-        hero = ""
-        if user:
-            hero = f'<div class="customer-hero" style="margin-bottom:24px"><div class="avatar">{user["name"][0].upper()}</div><div class="info"><h2>{user["name"]}</h2><div class="meta">{user.get("address","")} &middot; {user.get("town","")} &middot; {user.get("postcode","")}</div></div><a href="/lookup?phone={phone}" class="btn btn-ghost" style="margin-left:auto">&#x2190; Profile</a></div>'
-    else:
-        phone_field = '<div class="form-group"><label>Phone Number</label><input type="tel" name="phone" placeholder="+44 7700 900000" required></div>'
-        cancel_btn  = ""
-        hero        = ""
-
-    body = f'''
-    <h1 style="margin-bottom:24px">Add Order</h1>
-    {hero}
-    <div class="card">
-      <form method="POST" action="/save_order">
-        {phone_field}
-        <div class="form-group">
-          <label>Order Date</label>
-          <input type="date" name="date" value="{datetime.today().date()}" style="max-width:200px">
-        </div>
-        <div class="form-group">
-          <label>Products &nbsp;<span style="color:var(--muted);font-weight:400;text-transform:none;letter-spacing:0">tap once = qty 1, tap again for more</span></label>
-          <div class="product-grid">{tiles}</div>
-        </div>
-        <input type="hidden" name="items" id="items-input">
-        <div style="display:flex;gap:10px;margin-top:8px">
-          <button type="submit" class="btn btn-primary" onclick="return prepareSubmit()">Save Order</button>
-          {cancel_btn}
-        </div>
-      </form>
-    </div>
-
-    <script>
-    const items = {{}};
-    function addQty(id) {{
-      items[id] = (items[id] || 0) + 1;
-      document.getElementById("qty-" + id).textContent = items[id];
-      document.getElementById("tile-" + id).classList.add("selected");
-    }}
-    function resetTile(id) {{
-      delete items[id];
-      document.getElementById("qty-" + id).textContent = "";
-      document.getElementById("tile-" + id).classList.remove("selected");
-    }}
-    function prepareSubmit() {{
-      if (!Object.keys(items).length) {{ alert("Select at least one product."); return false; }}
-      document.getElementById("items-input").value = JSON.stringify(items);
-      return true;
-    }}
-    </script>'''
-
-    return page("Add Order", body)
-
-
 @app.route("/save_order", methods=["POST"])
 @login_required
 def save_order():
@@ -742,8 +699,8 @@ def save_order():
     date = request.form.get("date") or str(datetime.today().date())
 
     try:
-        items = json.loads(request.form.get("items", "{}"))
-    except:
+        items = json.loads(request.form.get("items","{}"))
+    except Exception:
         items = {}
 
     if not items:
@@ -752,8 +709,9 @@ def save_order():
     conn = get_db()
     cur = conn.cursor()
 
+    # ensure customer exists
     if not get_customer(phone):
-        cur.execute("INSERT INTO customers (phone, name) VALUES (%s, %s)", (phone, "Unknown"))
+        cur.execute("INSERT INTO customers (phone,name) VALUES (%s,%s)", (phone,"Unknown"))
 
     cur.execute(
         "INSERT INTO orders (phone, order_date) VALUES (%s,%s) RETURNING id",
@@ -762,24 +720,12 @@ def save_order():
     oid = cur.fetchone()[0]
 
     for pid, qty in items.items():
-        pid, qty = int(pid), int(qty)
-
         cur.execute(
             "INSERT INTO order_items (order_id, product_id, quantity) VALUES (%s,%s,%s)",
-            (oid, pid, qty)
+            (oid, int(pid), int(qty))
         )
 
-        # NEW: inventory deduction
-        cur.execute("""
-            UPDATE inventory
-            SET quantity = COALESCE(quantity,0) - %s
-            WHERE product_id=%s
-        """,(qty, pid))
-
-    conn.commit()
-    cur.close()
-    conn.close()
-
+    conn.commit(); cur.close(); conn.close()
     return redirect(f"/lookup?phone={phone}")
 
 @app.route("/search")
@@ -813,7 +759,6 @@ def search():
           <td style="color:var(--muted);font-size:.82rem">{gas_disp}</td>
           <td>
             <a href="/lookup?phone={phone}" class="btn btn-ghost" style="padding:6px 12px;font-size:.78rem">View</a>
-            <a href="/order?phone={phone}"  class="btn btn-primary" style="padding:6px 12px;font-size:.78rem;margin-left:6px">+ Order</a>
           </td>
         </tr>'''
 
@@ -822,7 +767,6 @@ def search():
     <h1>Customers <span class="pill" style="font-size:.9rem;vertical-align:middle">{len(customers)}</span></h1>
     <div style="display:flex;gap:10px">
         <a href="/add_customer" class="btn btn-ghost">+ Add Customer</a>
-        <a href="/order" class="btn btn-primary">+ Manual Order</a>
     </div>
     </div>
 
@@ -867,10 +811,11 @@ def search():
 
     return page("Customers", body, wide=True)
 
-@app.route("/add_customer", methods=["GET", "POST"])
+@app.route("/add_customer", methods=["GET","POST"])
 @login_required
 def add_customer():
-    phone_prefill = request.args.get("phone", "")
+    phone_prefill = normalize_phone(request.args.get("phone",""))
+
     if request.method == "POST":
         phone = normalize_phone(request.form.get("phone"))
         name  = request.form.get("name")
@@ -880,53 +825,52 @@ def add_customer():
 
         conn = get_db()
         cur = conn.cursor()
-        cur.execute('''
+        cur.execute("""
             INSERT INTO customers (phone, name, address, town, postcode)
-            VALUES (%s, %s, %s, %s, %s)
+            VALUES (%s,%s,%s,%s,%s)
             ON CONFLICT (phone) DO UPDATE
-            SET name = EXCLUDED.name,
-                address = EXCLUDED.address,
-                town = EXCLUDED.town,
-                postcode = EXCLUDED.postcode
-        ''', (phone, name, address, town, postcode))
+            SET name=EXCLUDED.name,
+                address=EXCLUDED.address,
+                town=EXCLUDED.town,
+                postcode=EXCLUDED.postcode
+        """, (phone,name,address,town,postcode))
         conn.commit()
-        cur.close()
-        conn.close()
+        cur.close(); conn.close()
 
         if "save_and_order" in request.form:
-            return redirect(f"/order?phone={phone}")
+            return redirect(f"/lookup?phone={phone}")
         return redirect("/search")
 
+    # Render form with prefilled phone
     body = f'''
-    <h1 style="margin-bottom:24px">Add Customer</h1>
     <div class="card">
-      <form method="POST">
-        <div class="form-group">
-          <label>Name</label>
-          <input type="text" name="name" required>
-        </div>
-        <div class="form-group">
-          <label>Phone</label>
-          <input type="tel" name="phone" value="{phone_prefill}" required>
-        </div>
-        <div class="form-group">
-          <label>Address</label>
-          <input type="text" name="address">
-        </div>
-        <div class="form-group">
-          <label>Town</label>
-          <input type="text" name="town">
-        </div>
-        <div class="form-group">
-          <label>Postcode</label>
-          <input type="text" name="postcode">
-        </div>
+        <form method="POST">
+            <div class="form-group">
+                <label>Phone</label>
+                <input type="tel" name="phone" value="{phone_prefill}" required class="modern-input">
+            </div>
+            <div class="form-group">
+                <label>Name</label>
+                <input type="text" name="name" class="modern-input">
+            </div>
+            <div class="form-group">
+                <label>Address</label>
+                <input type="text" name="address" class="modern-input">
+            </div>
+            <div class="form-group">
+                <label>Town</label>
+                <input type="text" name="town" class="modern-input">
+            </div>
+            <div class="form-group">
+                <label>Postcode</label>
+                <input type="text" name="postcode" class="modern-input">
+            </div>
 
-        <div style="display:flex;gap:10px">
-          <button class="btn btn-primary">Save</button>
-          <button name="save_and_order" class="btn btn-ghost">Save & Add Order</button>
-        </div>
-      </form>
+            <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:16px">
+                <button class="btn btn-primary" name="save_only">Save</button>
+                <button class="btn btn-secondary" name="save_and_order">Save & Add Order</button>
+            </div>
+        </form>
     </div>
     '''
     return page("Add Customer", body)
@@ -1131,11 +1075,39 @@ def cash():
     <h1>Cash</h1>
 
     <div class="card">
-        <form method="POST">
-            <input name="amount" placeholder="Amount (£)" required>
-            <input name="desc" placeholder="Description">
-            <button class="btn btn-primary">Add</button>
+        <h3>Cash Payments</h3>
+        <form method="POST" action="/add_cash" style="display:flex;gap:10px;align-items:center">
+            <input type="date" name="date" class="modern-input" value="{{today}}">
+            <input type="number" name="amount" placeholder="Amount (£)" step="0.01" class="modern-input">
+            <input type="text" name="note" placeholder="Note" class="modern-input">
+            <button class="btn btn-primary" style="margin-left:auto">Add Payment</button>
         </form>
+
+        <table class="modern-table" style="margin-top:16px">
+            <thead>
+                <tr>
+                    <th>Date</th>
+                    <th>Amount (£)</th>
+                    <th>Note</th>
+                    <th style="text-align:right">Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for c in last10 %}
+                <tr>
+                    <td>{{c.date}}</td>
+                    <td>{{c.amount}}</td>
+                    <td>{{c.note}}</td>
+                    <td style="text-align:right">
+                        <form method="POST" action="/delete_cash" style="display:inline">
+                            <input type="hidden" name="id" value="{{c.id}}">
+                            <button class="btn btn-danger">Delete</button>
+                        </form>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
     </div>
 
     <div class="section-header"><h3>Recent</h3></div>
@@ -1206,11 +1178,36 @@ def inventory():
     <h1>Inventory</h1>
 
     <div class="card">
-        <form method="POST" id="invForm">
-            {items}
-            <button type="button" class="btn btn-ghost" onclick="enableEdit()">Edit</button>
-            <button class="btn btn-primary">Save</button>
-        </form>
+        <h3>Inventory</h3>
+        <table class="modern-table">
+            <thead>
+                <tr>
+                    <th>Product</th>
+                    <th>Price (£)</th>
+                    <th>Quantity</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for p in products %}
+                <tr>
+                    <td><input type="text" value="{{p.name}}" class="modern-input"></td>
+                    <td><input type="number" value="{{p.price}}" class="modern-input" step="0.01"></td>
+                    <td><input type="number" value="{{p.qty}}" class="modern-input"></td>
+                    <td style="text-align:right">
+                        <button class="btn btn-ghost">Edit</button>
+                        <button class="btn btn-danger">Delete</button>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        <div style="margin-top:16px;display:flex;gap:10px">
+            <input type="text" placeholder="Product Name" class="modern-input">
+            <input type="number" placeholder="Price" class="modern-input" step="0.01">
+            <input type="number" placeholder="Qty" class="modern-input">
+            <button class="btn btn-primary">Add Product</button>
+        </div>
     </div>
 
     <script>
@@ -1219,7 +1216,6 @@ def inventory():
     }}
     </script>
     '''
-
     return page("Inventory", body)
 
 @app.route("/api/orders")
