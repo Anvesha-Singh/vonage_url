@@ -1042,7 +1042,7 @@ def cash():
     conn = get_db()
     cur = conn.cursor()
 
-    # Handle new cash payment
+    # Handle POST for new payment
     if request.method == "POST":
         amount = request.form.get("amount")
         note = request.form.get("note")
@@ -1053,7 +1053,7 @@ def cash():
         )
         conn.commit()
 
-    # Fetch last 10 entries
+    # Fetch last 10 payments
     cur.execute("""
         SELECT id, amount, description, created_at
         FROM cash_payments
@@ -1064,72 +1064,70 @@ def cash():
     cur.close()
     conn.close()
 
-    # Table rows
+    # Build table rows
     table_rows = ""
     for r in rows:
-        table_rows += f"""
-        <tr>
-            <td>{r['created_at']}</td>
-            <td>£{r['amount']}</td>
-            <td>{r['description']}</td>
-            <td style="text-align:right">
-                <form method="POST" action="/delete_cash" style="display:inline">
-                    <input type="hidden" name="id" value="{r['id']}">
-                    <button class="btn btn-danger">Delete</button>
-                </form>
-            </td>
-        </tr>
-        """
+        table_rows += (
+            "<tr>"
+            f"<td>{r['created_at']}</td>"
+            f"<td>£{r['amount']}</td>"
+            f"<td>{r['description']}</td>"
+            "<td style='text-align:right'>"
+            "<form method='POST' action='/delete_cash' style='display:inline'>"
+            f"<input type='hidden' name='id' value='{r['id']}'>"
+            "<button class='btn btn-danger'>Delete</button>"
+            "</form>"
+            "</td>"
+            "</tr>"
+        )
 
-    # Card view of last 10 entries
-    entries = ""
+    # Build card view of entries
+    entry_cards = ""
     for r in rows:
-        entries += f"""
-        <div class="order-card" style="display:flex;justify-content:space-between;align-items:center">
-            <div>
-                <div>£{r['amount']}</div>
-                <div>{r['description']}</div>
-                <div style="font-size:0.85em;color:gray">{r['created_at']}</div>
-            </div>
-            <form method="POST" action="/delete_cash" style="margin-left:16px">
-                <input type="hidden" name="id" value="{r['id']}">
-                <button class="btn btn-ghost">Delete</button>
-            </form>
-        </div>
-        """
+        entry_cards += (
+            "<div class='order-card' style='display:flex;justify-content:space-between;align-items:center'>"
+            "<div>"
+            f"<div>£{r['amount']}</div>"
+            f"<div>{r['description']}</div>"
+            f"<div style='font-size:0.85em;color:gray'>{r['created_at']}</div>"
+            "</div>"
+            "<form method='POST' action='/delete_cash' style='margin-left:16px'>"
+            f"<input type='hidden' name='id' value='{r['id']}'>"
+            "<button class='btn btn-ghost'>Delete</button>"
+            "</form>"
+            "</div>"
+        )
 
-    body = f"""
-    <h1>Cash Payments</h1>
+    # Build the full page body
+    body = (
+        "<h1>Cash Payments</h1>"
 
-    <div class="card" style="margin-bottom:24px;padding:16px">
-        <form method="POST" action="/cash" style="display:flex;gap:10px;align-items:center">
-            <input type="date" name="date" class="modern-input" value="{today}">
-            <input type="number" name="amount" placeholder="Amount (£)" step="0.01" class="modern-input">
-            <input type="text" name="note" placeholder="Note" class="modern-input">
-            <button class="btn btn-primary" style="margin-left:auto">Add Payment</button>
-        </form>
-    </div>
+        "<div class='card' style='margin-bottom:24px;padding:16px'>"
+        "<form method='POST' action='/cash' style='display:flex;gap:10px;align-items:center'>"
+        f"<input type='date' name='date' class='modern-input' value='{today}'>"
+        "<input type='number' name='amount' placeholder='Amount (£)' step='0.01' class='modern-input'>"
+        "<input type='text' name='note' placeholder='Note' class='modern-input'>"
+        "<button class='btn btn-primary' style='margin-left:auto'>Add Payment</button>"
+        "</form>"
+        "</div>"
 
-    <div class="card" style="padding:16px;margin-bottom:24px">
-        <h3>Last 10 Payments</h3>
-        <table class="modern-table" style="width:100%;border-collapse:collapse">
-            <thead>
-                <tr>
-                    <th>Date</th>
-                    <th>Amount (£)</th>
-                    <th>Note</th>
-                    <th style="text-align:right">Actions</th>
-                </tr>
-            </thead>
-            <tbody>
-                {table_rows}
-            </tbody>
-        </table>
-    </div>
+        "<div class='card' style='padding:16px;margin-bottom:24px'>"
+        "<h3>Last 10 Payments</h3>"
+        "<table class='modern-table' style='width:100%;border-collapse:collapse'>"
+        "<thead>"
+        "<tr><th>Date</th><th>Amount (£)</th><th>Note</th><th style='text-align:right'>Actions</th></tr>"
+        "</thead>"
+        "<tbody>"
+        + table_rows +
+        "</tbody>"
+        "</table>"
+        "</div>"
 
-    <div class="section-header"><h3>Recent Payments (Card View)</h3></div>
-    <div class="order-list">{entries}</div>
-    """
+        "<div class='section-header'><h3>Recent Payments (Card View)</h3></div>"
+        "<div class='order-list'>"
+        + entry_cards +
+        "</div>"
+    )
 
     return page("Cash", body)
 
@@ -1153,86 +1151,82 @@ def inventory():
     conn = get_db()
     cur = conn.cursor()
 
+    # Handle POST for edits, deletes, and new product
     if request.method == "POST":
-        for k,v in request.form.items():
+        # Update quantities and prices
+        for k, v in request.form.items():
             if k.startswith("qty_"):
                 pid = k.split("_")[1]
                 cur.execute("""
                     INSERT INTO inventory (product_id, quantity)
-                    VALUES (%s,%s)
-                    ON CONFLICT (product_id)
-                    DO UPDATE SET quantity=%s
-                """,(pid,v,v))
-
-            if k.startswith("price_"):
+                    VALUES (%s, %s)
+                    ON CONFLICT (product_id) DO UPDATE SET quantity=%s
+                """, (pid, v, v))
+            elif k.startswith("price_"):
                 pid = k.split("_")[1]
-                cur.execute("UPDATE products SET price=%s WHERE id=%s",(v,pid))
+                cur.execute("UPDATE products SET price=%s WHERE id=%s", (v, pid))
+
+        # Add new product
+        if "new_name" in request.form and request.form["new_name"].strip():
+            name = request.form["new_name"].strip()
+            price = request.form.get("new_price") or 0
+            qty = request.form.get("new_qty") or 0
+            cur.execute("INSERT INTO products (name, price) VALUES (%s,%s) RETURNING id", (name, price))
+            new_pid = cur.fetchone()["id"]
+            cur.execute("INSERT INTO inventory (product_id, quantity) VALUES (%s,%s)", (new_pid, qty))
+
+        # Delete product
+        if "delete_pid" in request.form:
+            pid = request.form["delete_pid"]
+            cur.execute("DELETE FROM inventory WHERE product_id=%s", (pid,))
+            cur.execute("DELETE FROM products WHERE id=%s", (pid,))
 
         conn.commit()
 
+    # Fetch current products + inventory
     cur.execute("""
-        SELECT p.id, p.name, p.price, COALESCE(i.quantity,0) qty
+        SELECT p.id, p.name, p.price, COALESCE(i.quantity,0) as qty
         FROM products p
         LEFT JOIN inventory i ON p.id=i.product_id
+        ORDER BY p.name
     """)
     rows = cur.fetchall()
-
-    items = "".join([
-        f'''
-        <div class="order-card">
-            <div style="flex:1">{r["name"]}</div>
-            <input name="qty_{r["id"]}" value="{r["qty"]}" disabled>
-            <input name="price_{r["id"]}" value="{r["price"]}" disabled>
-        </div>
-        '''
-        for r in rows
-    ])
-
     cur.close()
     conn.close()
 
-    body = f'''
-    <h1>Inventory</h1>
+    # Build table rows
+    table_rows = ""
+    for r in rows:
+        table_rows += (
+            "<tr>"
+            f"<td><input type='text' name='name_{r['id']}' value='{r['name']}' class='modern-input'></td>"
+            f"<td><input type='number' name='price_{r['id']}' value='{r['price']}' step='0.01' class='modern-input'></td>"
+            f"<td><input type='number' name='qty_{r['id']}' value='{r['qty']}' class='modern-input'></td>"
+            "<td style='text-align:right'>"
+            f"<button type='submit' name='edit_pid' value='{r['id']}' class='btn btn-ghost'>Save</button> "
+            f"<button type='submit' name='delete_pid' value='{r['id']}' class='btn btn-danger'>Delete</button>"
+            "</td>"
+            "</tr>"
+        )
 
-    <div class="card">
-        <h3>Inventory</h3>
-        <table class="modern-table">
-            <thead>
-                <tr>
-                    <th>Product</th>
-                    <th>Price (£)</th>
-                    <th>Quantity</th>
-                    <th>Actions</th>
-                </tr>
-            </thead>
-            <tbody>
-                {% for p in products %}
-                <tr>
-                    <td><input type="text" value="{{p.name}}" class="modern-input"></td>
-                    <td><input type="number" value="{{p.price}}" class="modern-input" step="0.01"></td>
-                    <td><input type="number" value="{{p.qty}}" class="modern-input"></td>
-                    <td style="text-align:right">
-                        <button class="btn btn-ghost">Edit</button>
-                        <button class="btn btn-danger">Delete</button>
-                    </td>
-                </tr>
-                {% endfor %}
-            </tbody>
-        </table>
-        <div style="margin-top:16px;display:flex;gap:10px">
-            <input type="text" placeholder="Product Name" class="modern-input">
-            <input type="number" placeholder="Price" class="modern-input" step="0.01">
-            <input type="number" placeholder="Qty" class="modern-input">
-            <button class="btn btn-primary">Add Product</button>
-        </div>
-    </div>
+    body = (
+        "<h1>Inventory</h1>"
+        "<form method='POST' style='width:100%'>"
+        "<table class='modern-table' style='width:100%;border-collapse:collapse'>"
+        "<thead><tr><th>Product</th><th>Price (£)</th><th>Quantity</th><th>Actions</th></tr></thead>"
+        "<tbody>"
+        + table_rows +
+        "</tbody></table>"
 
-    <script>
-    function enableEdit(){{
-        document.querySelectorAll("#invForm input").forEach(i=>i.disabled=false);
-    }}
-    </script>
-    '''
+        "<div style='margin-top:16px;display:flex;gap:10px;align-items:center'>"
+        "<input type='text' name='new_name' placeholder='Product Name' class='modern-input'>"
+        "<input type='number' name='new_price' placeholder='Price' step='0.01' class='modern-input'>"
+        "<input type='number' name='new_qty' placeholder='Qty' class='modern-input'>"
+        "<button type='submit' class='btn btn-primary'>Add Product</button>"
+        "</div>"
+        "</form>"
+    )
+
     return page("Inventory", body)
 
 @app.route("/api/orders")
