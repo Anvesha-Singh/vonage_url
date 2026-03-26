@@ -46,19 +46,25 @@ def clean_phone(phone):
     return digits
 
 def get_customer(phone):
-    """Fetch customer by cleaned phone."""
+    """Fetch customer by cleaned 10-digit phone."""
     phone_clean = clean_phone(phone)
     if not phone_clean:
         return None
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM customers WHERE RIGHT(phone, 10) = %s LIMIT 1", (phone_clean,))
+    # Match exactly the 10 digits stored
+    cur.execute("SELECT * FROM customers WHERE phone = %s LIMIT 1", (phone_clean,))
     row = cur.fetchone()
     cur.close()
     conn.close()
     return dict(row) if row else None
 
 def get_orders(phone, limit=None):
+    """Fetch orders by cleaned 10-digit phone."""
+    phone_clean = clean_phone(phone)
+    if not phone_clean:
+        return []
+
     conn = get_db()
     cur = conn.cursor()
 
@@ -73,9 +79,8 @@ def get_orders(phone, limit=None):
     if limit:
         q += f" LIMIT {limit}"
 
-    cur.execute(q, (phone,))
+    cur.execute(q, (phone_clean,))
     rows = cur.fetchall()
-
     cur.close()
     conn.close()
 
