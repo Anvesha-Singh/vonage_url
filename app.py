@@ -34,41 +34,28 @@ def get_db():
     conn = psycopg2.connect(url, cursor_factory=psycopg2.extras.DictCursor, sslmode='require')
     return conn
 
-def normalize_phone(phone):
-    """Normalize a phone number to +44 format."""
+def clean_phone(phone):
+    """Strip non-digit chars and remove leading 0 or 44."""
     if not phone:
         return None
     digits = re.sub(r'\D', '', str(phone))
     if digits.startswith('0'):
-        digits = '44' + digits[1:]
-    elif len(digits) == 10:
-        digits = '44' + digits
+        digits = digits[1:]
     elif digits.startswith('44'):
-        pass
-    # truncate to max 12 digits after country code
-    return f"+{digits[:12]}" if digits.startswith('44') else f"+{digits}"
+        digits = digits[2:]
+    return digits
 
 def get_customer(phone):
-    """Fetch customer by phone, checking both +44 and 0 formats."""
-    if not phone:
+    """Fetch customer by cleaned phone."""
+    phone_clean = clean_phone(phone)
+    if not phone_clean:
         return None
-
-    phone_norm = normalize_phone(phone)
-    phone_alt  = None
-    if phone_norm.startswith("+44"):
-        phone_alt = "0" + phone_norm[3:]  # 0-prefixed version
-
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("""
-        SELECT * FROM customers
-        WHERE phone = %s OR phone = %s
-        LIMIT 1
-    """, (phone_norm, phone_alt))
+    cur.execute("SELECT * FROM customers WHERE RIGHT(phone, 10) = %s LIMIT 1", (phone_clean,))
     row = cur.fetchone()
     cur.close()
     conn.close()
-
     return dict(row) if row else None
 
 def get_orders(phone, limit=None):
@@ -541,8 +528,8 @@ def login():
 @app.route("/lookup")
 @login_required
 def lookup():
-    raw = request.args.get("phone", "")
-    phone = normalize_phone(raw)
+    raw = request.args.get("phone","")
+    phone = clean_phone(raw)
 
     user = get_customer(phone) if phone else None
     orders = get_orders(phone) if phone else []
@@ -550,18 +537,16 @@ def lookup():
 
     if not phone:
         body = f'<div class="unknown-banner"><h2>Invalid number</h2><p class="meta">{raw}</p></div>'
-
     elif not user:
         body = f'''
         <div class="unknown-banner">
             <h2>Unknown caller</h2>
-            <p class="meta">{phone}</p>
+            <p class="meta">{raw}</p>
             <div style="margin-top:16px;display:flex;gap:10px">
                 <a href="/add_customer?phone={phone}" class="btn btn-primary">+ Add Customer</a>
             </div>
         </div>
         '''
-
     else:
         initial = (user['name'] or '?')[0].upper()
 
@@ -788,7 +773,7 @@ def search():
     document.querySelectorAll("#table-body tr").forEach(r => {{
         const name = r.dataset.name || "";
         const phone = r.dataset.phone || "";
-        const altPhone = phone.replace("+44","0");  
+        const altPhone = phone.replace(/^0|^44|\+/g,"");
         const addr = r.dataset.address || "";
         const postcode = r.dataset.postcode || "";
         const gas = r.dataset.gas || "";
