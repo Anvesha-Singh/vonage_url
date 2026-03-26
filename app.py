@@ -1036,16 +1036,24 @@ def analytics():
 @app.route("/cash", methods=["GET","POST"])
 @login_required
 def cash():
+    from datetime import date
+    today = date.today()
+
     conn = get_db()
     cur = conn.cursor()
 
+    # Handle new cash payment
     if request.method == "POST":
+        amount = request.form.get("amount")
+        note = request.form.get("note")
+        pay_date = request.form.get("date") or str(today)
         cur.execute(
-            "INSERT INTO cash_payments (amount, description) VALUES (%s,%s)",
-            (request.form.get("amount"), request.form.get("desc"))
+            "INSERT INTO cash_payments (amount, description, created_at) VALUES (%s,%s,%s)",
+            (amount, note, pay_date)
         )
         conn.commit()
 
+    # Fetch last 10 entries
     cur.execute("""
         SELECT id, amount, description, created_at
         FROM cash_payments
@@ -1053,67 +1061,75 @@ def cash():
         LIMIT 10
     """)
     rows = cur.fetchall()
-
-    entries = "".join([
-        f'''
-        <div class="order-card">
-            <div>£{r["amount"]}</div>
-            <div>{r["description"]}</div>
-            <form method="POST" action="/delete_cash">
-                <input type="hidden" name="id" value="{r["id"]}">
-                <button class="btn btn-ghost">Delete</button>
-            </form>
-        </div>
-        '''
-        for r in rows
-    ])
-
     cur.close()
     conn.close()
 
-    body = f'''
-    <h1>Cash</h1>
+    # Table rows
+    table_rows = ""
+    for r in rows:
+        table_rows += f"""
+        <tr>
+            <td>{r['created_at']}</td>
+            <td>£{r['amount']}</td>
+            <td>{r['description']}</td>
+            <td style="text-align:right">
+                <form method="POST" action="/delete_cash" style="display:inline">
+                    <input type="hidden" name="id" value="{r['id']}">
+                    <button class="btn btn-danger">Delete</button>
+                </form>
+            </td>
+        </tr>
+        """
 
-    <div class="card">
-        <h3>Cash Payments</h3>
-        <form method="POST" action="/add_cash" style="display:flex;gap:10px;align-items:center">
-            <input type="date" name="date" class="modern-input" value="{{today}}">
+    # Card view of last 10 entries
+    entries = ""
+    for r in rows:
+        entries += f"""
+        <div class="order-card" style="display:flex;justify-content:space-between;align-items:center">
+            <div>
+                <div>£{r['amount']}</div>
+                <div>{r['description']}</div>
+                <div style="font-size:0.85em;color:gray">{r['created_at']}</div>
+            </div>
+            <form method="POST" action="/delete_cash" style="margin-left:16px">
+                <input type="hidden" name="id" value="{r['id']}">
+                <button class="btn btn-ghost">Delete</button>
+            </form>
+        </div>
+        """
+
+    body = f"""
+    <h1>Cash Payments</h1>
+
+    <div class="card" style="margin-bottom:24px;padding:16px">
+        <form method="POST" action="/cash" style="display:flex;gap:10px;align-items:center">
+            <input type="date" name="date" class="modern-input" value="{today}">
             <input type="number" name="amount" placeholder="Amount (£)" step="0.01" class="modern-input">
             <input type="text" name="note" placeholder="Note" class="modern-input">
             <button class="btn btn-primary" style="margin-left:auto">Add Payment</button>
         </form>
-
-        rows = ""
-        for c in last10:
-            rows += f"""
-            <tr>
-                <td>{c['date']}</td>
-                <td>{c['amount']}</td>
-                <td>{c['note']}</td>
-                <td style="text-align:right">
-                    <form method="POST" action="/delete_cash" style="display:inline">
-                        <input type="hidden" name="id" value="{c['id']}">
-                        <button class="btn btn-danger">Delete</button>
-                    </form>
-                </td>
-            </tr>
-            """
-
-        body = f"""
-        <table class="modern-table">
-        <thead>
-        <tr><th>Date</th><th>Amount (£)</th><th>Note</th><th>Actions</th></tr>
-        </thead>
-        <tbody>
-        {rows}
-        </tbody>
-        </table>
-        """
     </div>
 
-    <div class="section-header"><h3>Recent</h3></div>
+    <div class="card" style="padding:16px;margin-bottom:24px">
+        <h3>Last 10 Payments</h3>
+        <table class="modern-table" style="width:100%;border-collapse:collapse">
+            <thead>
+                <tr>
+                    <th>Date</th>
+                    <th>Amount (£)</th>
+                    <th>Note</th>
+                    <th style="text-align:right">Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                {table_rows}
+            </tbody>
+        </table>
+    </div>
+
+    <div class="section-header"><h3>Recent Payments (Card View)</h3></div>
     <div class="order-list">{entries}</div>
-    '''
+    """
 
     return page("Cash", body)
 
