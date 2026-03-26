@@ -14,6 +14,7 @@ import re
 import json
 from datetime import datetime, timedelta
 from flask import Flask, request, redirect, jsonify
+import requests
 
 app = Flask(__name__)
 
@@ -36,37 +37,37 @@ def get_db():
 def normalize_phone(phone):
     if not phone:
         return None
+
     clean = re.sub(r'\D', '', str(phone))
 
-    if clean.startswith('44'):
-        return "+44" + clean[2:]
     if clean.startswith('0'):
-        return "+44" + clean[1:]
-    if len(clean) == 10:
-        return "+44" + clean
+        clean = '44' + clean[1:]
+    elif clean.startswith('44'):
+        pass
+    elif len(clean) == 10:
+        clean = '44' + clean
+    if clean.startswith('44') and len(clean) > 12:
+        clean = clean[:12]
 
-    return "+44" + clean
+    return f"+{clean}"
 
-# NEW: flexible lookup
 def get_customer(phone):
     if not phone:
         return None
 
-    variants = [
-        phone,
-        phone.replace("+44", "0"),
-        phone.replace("+44", "")
-    ]
+    alt = phone.replace("+44", "0")
 
     conn = get_db()
     cur = conn.cursor()
-    cur.execute(
-        "SELECT * FROM customers WHERE phone = ANY(%s)",
-        (variants,)
-    )
+    cur.execute("""
+        SELECT * FROM customers 
+        WHERE phone = %s OR phone = %s
+    """, (phone, normalize_phone(alt)))
+    
     row = cur.fetchone()
     cur.close()
     conn.close()
+
     return dict(row) if row else None
 
 def get_orders(phone, limit=None):
@@ -210,29 +211,21 @@ def get_daily_sales(start, end):
     return rows
 
 def get_weather_range(start, end):
-    # London coords
-    lat, lon = 51.5072, -0.1276
+    try:
+        url = "https://api.open-meteo.com/v1/forecast"
+        params = {
+            "latitude": 51.5072,
+            "longitude": -0.1276,
+            "daily": "temperature_2m_mean",
+            "start_date": start,
+            "end_date": end,
+            "timezone": "Europe/London"
+        }
 
-    url = "https://archive-api.open-meteo.com/v1/archive"
-    params = {
-        "latitude": lat,
-        "longitude": lon,
-        "start_date": start,
-        "end_date": end,
-        "daily": "temperature_2m_mean",
-        "timezone": "Europe/London"
-    }
-
-    r = requests.get(url, params=params).json()
-
-    data = {}
-    dates = r.get("daily", {}).get("time", [])
-    temps = r.get("daily", {}).get("temperature_2m_mean", [])
-
-    for d, t in zip(dates, temps):
-        data[d] = t
-
-    return data
+        r = requests.get(url, params=params, timeout=5).json()
+        return dict(zip(r["daily"]["time"], r["daily"]["temperature_2m_mean"]))
+    except:
+        return {}
 
 # ── NEW: NEXT 3 DAYS PREDICTION ───────────────
 
@@ -458,6 +451,7 @@ STYLE = """
 NAV = """
 <nav>
   <a class="logo" href="/">Sleemans</a>
+  <a href="/analytics">Analytics</a>
   <a href="/search">Customers</a>
   <a href="/cash">Cash</a>
   <a href="/inventory">Inventory</a>
@@ -557,6 +551,11 @@ def lookup():
             <div class="order-card">
                 <div class="order-date">{o["date"]}</div>
                 <div class="order-items">{tags}</div>
+                <form method="POST" action="/delete_order" style="margin-left:auto">
+                    <input type="hidden" name="order_id" value="{o["id"]}">
+                    <input type="hidden" name="phone" value="{phone}">
+                    <button class="btn btn-ghost" style="padding:4px 8px">Delete</button>
+                </form>
             </div>
             '''
 
@@ -648,6 +647,22 @@ def lookup():
         '''
 
     return page("Lookup", body, wide=True)
+
+@app.route("/delete_order", methods=["POST"])
+@login_required
+def delete_order():
+    oid = request.form.get("order_id")
+    phone = request.form.get("phone")
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM order_items WHERE order_id=%s", (oid,))
+    cur.execute("DELETE FROM orders WHERE id=%s", (oid,))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    return redirect(f"/lookup?phone={phone}")
 
 @app.route("/order")
 @login_required
@@ -1077,29 +1092,71 @@ def analytics():
 @app.route("/cash", methods=["GET","POST"])
 @login_required
 def cash():
+    conn = get_db()
+    cur = conn.cursor()
+
     if request.method == "POST":
-        conn = get_db()
-        cur = conn.cursor()
         cur.execute(
             "INSERT INTO cash_payments (amount, description) VALUES (%s,%s)",
             (request.form.get("amount"), request.form.get("desc"))
         )
         conn.commit()
-        cur.close()
-        conn.close()
-        return redirect("/cash")
 
-    body = '''
-    <h1>Cash Payments</h1>
+    cur.execute("""
+        SELECT id, amount, description, created_at
+        FROM cash_payments
+        ORDER BY created_at DESC
+        LIMIT 10
+    """)
+    rows = cur.fetchall()
+
+    entries = "".join([
+        f'''
+        <div class="order-card">
+            <div>£{r["amount"]}</div>
+            <div>{r["description"]}</div>
+            <form method="POST" action="/delete_cash">
+                <input type="hidden" name="id" value="{r["id"]}">
+                <button class="btn btn-ghost">Delete</button>
+            </form>
+        </div>
+        '''
+        for r in rows
+    ])
+
+    cur.close()
+    conn.close()
+
+    body = f'''
+    <h1>Cash</h1>
+
     <div class="card">
         <form method="POST">
-            <input name="amount" placeholder="Amount">
+            <input name="amount" placeholder="Amount (£)" required>
             <input name="desc" placeholder="Description">
-            <button class="btn btn-primary">Save</button>
+            <button class="btn btn-primary">Add</button>
         </form>
     </div>
+
+    <div class="section-header"><h3>Recent</h3></div>
+    <div class="order-list">{entries}</div>
     '''
+
     return page("Cash", body)
+
+@app.route("/delete_cash", methods=["POST"])
+@login_required
+def delete_cash():
+    cid = request.form.get("id")
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM cash_payments WHERE id=%s", (cid,))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    return redirect("/cash")
 
 @app.route("/inventory", methods=["GET","POST"])
 @login_required
@@ -1109,36 +1166,60 @@ def inventory():
 
     if request.method == "POST":
         for k,v in request.form.items():
-            cur.execute("""
-                INSERT INTO inventory (product_id, quantity)
-                VALUES (%s,%s)
-                ON CONFLICT (product_id)
-                DO UPDATE SET quantity=%s
-            """,(k,v,v))
+            if k.startswith("qty_"):
+                pid = k.split("_")[1]
+                cur.execute("""
+                    INSERT INTO inventory (product_id, quantity)
+                    VALUES (%s,%s)
+                    ON CONFLICT (product_id)
+                    DO UPDATE SET quantity=%s
+                """,(pid,v,v))
+
+            if k.startswith("price_"):
+                pid = k.split("_")[1]
+                cur.execute("UPDATE products SET price=%s WHERE id=%s",(v,pid))
+
         conn.commit()
 
     cur.execute("""
-        SELECT p.id, p.name, COALESCE(i.quantity,0) as qty
+        SELECT p.id, p.name, p.price, COALESCE(i.quantity,0) qty
         FROM products p
         LEFT JOIN inventory i ON p.id=i.product_id
     """)
     rows = cur.fetchall()
-    cur.close(); conn.close()
 
-    inputs = "".join([
-        f'<div>{r["name"]} <input name="{r["id"]}" value="{r["qty"]}"></div>'
+    items = "".join([
+        f'''
+        <div class="order-card">
+            <div style="flex:1">{r["name"]}</div>
+            <input name="qty_{r["id"]}" value="{r["qty"]}" disabled>
+            <input name="price_{r["id"]}" value="{r["price"]}" disabled>
+        </div>
+        '''
         for r in rows
     ])
 
+    cur.close()
+    conn.close()
+
     body = f'''
     <h1>Inventory</h1>
+
     <div class="card">
-        <form method="POST">
-            {inputs}
-            <button class="btn btn-primary">Update</button>
+        <form method="POST" id="invForm">
+            {items}
+            <button type="button" class="btn btn-ghost" onclick="enableEdit()">Edit</button>
+            <button class="btn btn-primary">Save</button>
         </form>
     </div>
+
+    <script>
+    function enableEdit(){{
+        document.querySelectorAll("#invForm input").forEach(i=>i.disabled=false);
+    }}
+    </script>
     '''
+
     return page("Inventory", body)
 
 @app.route("/api/orders")
