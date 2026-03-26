@@ -35,39 +35,28 @@ def get_db():
     return conn
 
 def normalize_phone(phone):
+    """Normalize a phone number to +44 format."""
     if not phone:
         return None
-
-    clean = re.sub(r'\D', '', str(phone))
-
-    if clean.startswith('0'):
-        clean = '44' + clean[1:]
-    elif clean.startswith('44'):
+    digits = re.sub(r'\D', '', str(phone))
+    if digits.startswith('0'):
+        digits = '+44' + digits[1:]
+    elif len(digits) == 10:
+        digits = '+44' + digits
+    elif digits.startswith('+44'):
         pass
-    elif len(clean) == 10:
-        clean = '44' + clean
-    if clean.startswith('44') and len(clean) > 12:
-        clean = clean[:12]
-
-    return f"+{clean}"
+    # truncate to max 12 digits after country code
+    return f"+{digits[:12]}" if digits.startswith('+44') else f"+{digits}"
 
 def get_customer(phone):
-    if not phone:
+    """Fetch customer by normalized phone number."""
+    phone_norm = normalize_phone(phone)
+    if not phone_norm:
         return None
-
-    # normalize both +44 and 0 forms
-    phone_plus44 = normalize_phone(phone)
-    phone_zero  = None
-    if phone_plus44.startswith("+44"):
-        phone_zero = "0" + phone_plus44[3:]
 
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("""
-        SELECT * FROM customers 
-        WHERE phone = %s OR phone = %s
-    """, (phone_plus44, phone_zero))
-    
+    cur.execute("SELECT * FROM customers WHERE phone = %s", (phone_norm,))
     row = cur.fetchone()
     cur.close()
     conn.close()
@@ -1122,11 +1111,6 @@ def cash():
         "</tbody>"
         "</table>"
         "</div>"
-
-        "<div class='section-header'><h3>Recent Payments (Card View)</h3></div>"
-        "<div class='order-list'>"
-        + entry_cards +
-        "</div>"
     )
 
     return page("Cash", body)
@@ -1199,11 +1183,11 @@ def inventory():
     for r in rows:
         table_rows += (
             "<tr>"
-            f"<td><input type='text' name='name_{r['id']}' value='{r['name']}' class='modern-input'></td>"
-            f"<td><input type='number' name='price_{r['id']}' value='{r['price']}' step='0.01' class='modern-input'></td>"
-            f"<td><input type='number' name='qty_{r['id']}' value='{r['qty']}' class='modern-input'></td>"
+            f"<td><input type='text' name='name_{r['id']}' value='{r['name']}' class='modern-input' disabled></td>"
+            f"<td><input type='number' name='price_{r['id']}' value='{r['price']}' step='0.01' class='modern-input' disabled></td>"
+            f"<td><input type='number' name='qty_{r['id']}' value='{r['qty']}' class='modern-input' disabled></td>"
             "<td style='text-align:right'>"
-            f"<button type='submit' name='edit_pid' value='{r['id']}' class='btn btn-ghost'>Save</button> "
+            f"<button type='submit' name='edit_pid' value='{r['id']}' class='btn btn-ghost' disabled>Save</button> "
             f"<button type='submit' name='delete_pid' value='{r['id']}' class='btn btn-danger'>Delete</button>"
             "</td>"
             "</tr>"
@@ -1211,6 +1195,9 @@ def inventory():
 
     body = (
         "<h1>Inventory</h1>"
+        "<div style='display:flex;justify-content:flex-end;margin-bottom:8px'>"
+        "<button class='btn btn-primary' onclick='enableEdit();return false;'>Edit Inventory</button>"
+        "</div>"
         "<form method='POST' style='width:100%'>"
         "<table class='modern-table' style='width:100%;border-collapse:collapse'>"
         "<thead><tr><th>Product</th><th>Price (£)</th><th>Quantity</th><th>Actions</th></tr></thead>"
@@ -1225,9 +1212,72 @@ def inventory():
         "<button type='submit' class='btn btn-primary'>Add Product</button>"
         "</div>"
         "</form>"
+
+        "<script>"
+        "function enableEdit(){"
+        "  document.querySelectorAll('input.modern-input').forEach(i=>i.disabled=false);"
+        "  document.querySelectorAll('button[name=edit_pid]').forEach(b=>b.disabled=false);"
+        "}"
+        "</script>"
     )
 
     return page("Inventory", body)
+
+
+def cash():
+    conn = get_db()
+    cur = conn.cursor()
+
+    if request.method == "POST":
+        cur.execute(
+            "INSERT INTO cash_payments (amount, description) VALUES (%s,%s)",
+            (request.form.get("amount"), request.form.get("desc"))
+        )
+        conn.commit()
+
+    cur.execute("""
+        SELECT id, amount, description, created_at
+        FROM cash_payments
+        ORDER BY created_at DESC
+        LIMIT 10
+    """)
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    table_rows = ""
+    for r in rows:
+        table_rows += (
+            "<tr>"
+            f"<td>{r['created_at']}</td>"
+            f"<td>£{r['amount']}</td>"
+            f"<td>{r['description']}</td>"
+            "<td style='text-align:right'>"
+            f"<form method='POST' action='/delete_cash' style='display:inline'>"
+            f"<input type='hidden' name='id' value='{r['id']}'>"
+            f"<button class='btn btn-danger'>Delete</button>"
+            "</form>"
+            "</td></tr>"
+        )
+
+    body = (
+        "<h1>Cash</h1>"
+        "<div class='card'>"
+        "<h3>Last 10 Payments</h3>"
+        "<form method='POST' action='/cash' style='display:flex;gap:10px;align-items:center'>"
+        "<input type='date' name='date' class='modern-input' value='{datetime.today().date()}'>"
+        "<input type='number' name='amount' placeholder='Amount (£)' step='0.01' class='modern-input'>"
+        "<input type='text' name='desc' placeholder='Note' class='modern-input'>"
+        "<button type='submit' class='btn btn-primary' style='margin-left:auto'>Add Payment</button>"
+        "</form>"
+
+        "<table class='modern-table' style='width:100%;border-collapse:collapse;margin-top:16px'>"
+        "<thead><tr><th>Date</th><th>Amount (£)</th><th>Note</th><th>Actions</th></tr></thead>"
+        "<tbody>" + table_rows + "</tbody></table>"
+        "</div>"
+    )
+
+    return page("Cash", body)
 
 @app.route("/api/orders")
 @login_required
