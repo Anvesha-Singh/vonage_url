@@ -525,63 +525,129 @@ def lookup():
     raw = request.args.get("phone", "")
     phone = normalize_phone(raw)
 
-    user = get_customer(phone)
-    orders = get_orders(phone, limit=5)
+    user = get_customer(phone) if phone else None
+    orders = get_orders(phone) if phone else []
     products = get_all_products()
 
-    if not user:
-        return redirect(f"/add_customer?phone={phone}")
+    if not phone:
+        body = f'<div class="unknown-banner"><h2>Invalid number</h2><p class="meta">{raw}</p></div>'
 
-    # LEFT: orders
-    order_html = ""
-    for o in orders:
-        items = ", ".join([f'{i["product"]} x{i["qty"]}' for i in o["items"]])
-        order_html += f"<div>{o['date']} — {items} — £{o['total']}</div>"
-
-    # RIGHT: order UI
-    tiles = ""
-    for p in products:
-        tiles += f'''
-        <div onclick="addQty({p["id"]})">
-            {p["name"]} (£{p["price"]})
-            <span id="q{p["id"]}"></span>
+    elif not user:
+        body = f'''
+        <div class="unknown-banner">
+            <h2>Unknown caller</h2>
+            <p class="meta">{phone}</p>
+            <div style="margin-top:16px;display:flex;gap:10px">
+                <a href="/add_customer?phone={phone}" class="btn btn-primary">+ Add Customer</a>
+            </div>
         </div>
         '''
 
-    body = f'''
-    <h2>{user["name"]} ({phone})</h2>
+    else:
+        initial = (user['name'] or '?')[0].upper()
 
-    <div style="display:flex;gap:40px">
-        <div style="width:50%">
-            <h3>Last Orders</h3>
-            {order_html or "No orders"}
+        # LEFT SIDE: last 5 orders
+        order_cards = ""
+        for o in orders[:5]:
+            tags = "".join(
+                f'<span class="order-item-tag">{i["product"]}<span>x{i["qty"]}</span></span>'
+                for i in o["items"]
+            )
+            order_cards += f'''
+            <div class="order-card">
+                <div class="order-date">{o["date"]}</div>
+                <div class="order-items">{tags}</div>
+            </div>
+            '''
+
+        if not order_cards:
+            order_cards = '<div class="empty">No previous orders.</div>'
+
+        # RIGHT SIDE: order UI
+        tiles = ""
+        for p in products:
+            tiles += f'''
+            <div class="product-tile" id="tile-{p["id"]}" onclick="addQty({p["id"]})">
+                <div class="p-name">{p["name"]}</div>
+                <div class="p-qty" id="qty-{p["id"]}"></div>
+                <span class="p-reset" onclick="event.stopPropagation();resetTile({p["id"]})">&#x2715;</span>
+            </div>
+            '''
+
+        body = f'''
+        <div class="customer-hero">
+          <div class="avatar">{initial}</div>
+          <div class="info">
+            <h2>{user["name"]} <span class="badge">{phone}</span></h2>
+            <div class="meta">{user.get("address","")} &middot; {user.get("town","")} &middot; {user.get("postcode","")}</div>
+          </div>
+          <div style="margin-left:auto">
+            <a href="/edit_customer?phone={phone}" class="btn btn-ghost">Edit</a>
+          </div>
         </div>
 
-        <div style="width:50%">
-            <h3>Add Order</h3>
-            <form method="POST" action="/save_order">
-                <input type="hidden" name="phone" value="{phone}">
-                <input type="date" name="date" value="{datetime.today().date()}">
-                <div>{tiles}</div>
-                <input type="hidden" name="items" id="items">
-                <button onclick="prep()">Save</button>
-            </form>
+        <div style="display:flex;gap:24px;margin-top:32px;align-items:flex-start">
+
+            <!-- LEFT: Orders -->
+            <div style="flex:1">
+                <div class="section-header">
+                    <h3>Last Orders</h3>
+                </div>
+                <div class="order-list">{order_cards}</div>
+            </div>
+
+            <!-- RIGHT: Add Order -->
+            <div style="flex:1">
+                <div class="section-header">
+                    <h3>Add Order</h3>
+                </div>
+
+                <div class="card">
+                    <form method="POST" action="/save_order">
+                        <input type="hidden" name="phone" value="{phone}">
+
+                        <div class="form-group">
+                            <label>Date</label>
+                            <input type="date" name="date" value="{datetime.today().date()}">
+                        </div>
+
+                        <div class="product-grid">{tiles}</div>
+
+                        <input type="hidden" name="items" id="items-input">
+
+                        <button class="btn btn-primary" onclick="return prepareSubmit()">Save</button>
+                    </form>
+                </div>
+            </div>
         </div>
-    </div>
 
-    <script>
-    let items = {{}}
-    function addQty(id){{
-        items[id] = (items[id]||0)+1
-        document.getElementById("q"+id).innerText = items[id]
-    }}
-    function prep(){{
-        document.getElementById("items").value = JSON.stringify(items)
-    }}
-    </script>
-    '''
+        <script>
+        const items = {{}};
 
-    return body
+        function addQty(id){{
+            items[id]=(items[id]||0)+1;
+            document.getElementById("qty-"+id).textContent=items[id];
+            document.getElementById("tile-"+id).classList.add("selected");
+        }}
+
+        function resetTile(id){{
+            delete items[id];
+            document.getElementById("qty-"+id).textContent="";
+            document.getElementById("tile-"+id).classList.remove("selected");
+        }}
+
+        function prepareSubmit(){{
+            if(!Object.keys(items).length){{
+                alert("Select at least one product");
+                return false;
+            }}
+            document.getElementById("items-input").value = JSON.stringify(items);
+            return true;
+        }}
+        </script>
+        '''
+
+    return page("Lookup", body, wide=True)
 
 @app.route("/order")
 @login_required
@@ -1008,12 +1074,78 @@ def analytics():
 
     return page("Analytics", body, wide=True)
 
+@app.route("/cash", methods=["GET","POST"])
+@login_required
+def cash():
+    if request.method == "POST":
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO cash_payments (amount, description) VALUES (%s,%s)",
+            (request.form.get("amount"), request.form.get("desc"))
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+        return redirect("/cash")
+
+    body = '''
+    <h1>Cash Payments</h1>
+    <div class="card">
+        <form method="POST">
+            <input name="amount" placeholder="Amount">
+            <input name="desc" placeholder="Description">
+            <button class="btn btn-primary">Save</button>
+        </form>
+    </div>
+    '''
+    return page("Cash", body)
+
+@app.route("/inventory", methods=["GET","POST"])
+@login_required
+def inventory():
+    conn = get_db()
+    cur = conn.cursor()
+
+    if request.method == "POST":
+        for k,v in request.form.items():
+            cur.execute("""
+                INSERT INTO inventory (product_id, quantity)
+                VALUES (%s,%s)
+                ON CONFLICT (product_id)
+                DO UPDATE SET quantity=%s
+            """,(k,v,v))
+        conn.commit()
+
+    cur.execute("""
+        SELECT p.id, p.name, COALESCE(i.quantity,0) as qty
+        FROM products p
+        LEFT JOIN inventory i ON p.id=i.product_id
+    """)
+    rows = cur.fetchall()
+    cur.close(); conn.close()
+
+    inputs = "".join([
+        f'<div>{r["name"]} <input name="{r["id"]}" value="{r["qty"]}"></div>'
+        for r in rows
+    ])
+
+    body = f'''
+    <h1>Inventory</h1>
+    <div class="card">
+        <form method="POST">
+            {inputs}
+            <button class="btn btn-primary">Update</button>
+        </form>
+    </div>
+    '''
+    return page("Inventory", body)
+
 @app.route("/api/orders")
 @login_required
 def api_orders():
     phone = normalize_phone(request.args.get("phone", ""))
     return jsonify(get_orders(phone) if phone else [])
-
 
 if __name__ == "__main__":
 
