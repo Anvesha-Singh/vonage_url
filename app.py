@@ -754,9 +754,10 @@ def save_order():
 @app.route("/search")
 @login_required
 def search():
-    phone = u.get('phone', '') or ''
-    last_order = get_last_order_summary(phone)
     customers = get_all_customers()
+    for u in customers:
+        phone = u.get('phone', '') or ''
+        last_order = get_last_order_summary(phone)
 
     rows = ""
     for u in customers:
@@ -816,7 +817,7 @@ def search():
     document.querySelectorAll("#table-body tr").forEach(r => {{
         const name = r.dataset.name || "";
         const phone = r.dataset.phone || "";
-        const altPhone = phone.replace(/^0|^44|\+/g,"");
+        const altPhone = phone.replace(/^0|^44|\\+/g,"");
         const addr = r.dataset.address || "";
         const postcode = r.dataset.postcode || "";
         const gas = r.dataset.gas || "";
