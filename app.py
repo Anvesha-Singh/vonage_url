@@ -66,13 +66,17 @@ def get_last_orders_bulk():
     cur = conn.cursor()
 
     cur.execute("""
-        SELECT DISTINCT ON (o.phone)
-            o.phone,
+        SELECT o.phone,
             STRING_AGG(p.name || ' x' || oi.quantity, ', ') as summary
-        FROM orders o
+        FROM (
+            SELECT DISTINCT ON (phone) id, phone
+            FROM orders
+            ORDER BY phone, order_date DESC, id DESC
+        ) latest
+        JOIN orders o ON o.id = latest.id
         JOIN order_items oi ON o.id = oi.order_id
         JOIN products p ON oi.product_id = p.id
-        ORDER BY o.phone, o.order_date DESC, o.id DESC
+        GROUP BY o.phone
     """)
 
     rows = cur.fetchall()
@@ -758,25 +762,20 @@ def save_order():
 def search():
     customers = get_all_customers()
     last_orders_map = get_last_orders_bulk()
-    for u in customers:
-        phone = u.get('phone', '') or ''
-        last_order = last_orders_map.get(phone, "")
 
     rows = ""
     for u in customers:
-        name     = u.get('name', '') or ''
-        phone    = u.get('phone', '') or ''
-        town     = u.get('town', '') or ''
-        postcode = u.get('postcode', '') or ''
-        gas      = u.get('gas_request', '') or ''
-        initial  = (name or '?')[0].upper()
-        gas_disp = gas if gas not in ('nan', '') else ''
+        name       = u.get('name', '') or ''
+        phone      = u.get('phone', '') or ''
+        town       = u.get('town', '') or ''
+        postcode   = u.get('postcode', '') or ''
+        initial    = (name or '?')[0].upper()
+        last_order = last_orders_map.get(phone, "")
 
-        rows += f'''<tr data-name="{(name or '').lower()}" 
-                    data-phone="{phone or ''}" 
+        rows += f'''<tr data-name="{name.lower()}" 
+                    data-phone="{phone}" 
                     data-address="{(u.get('address') or '').lower()}" 
-                    data-postcode="{(u.get('postcode') or '').lower()}" 
-                    data-gas="{(u.get('gas_request') or '').lower()}">
+                    data-postcode="{postcode}">
           <td>
             <div style="display:flex;align-items:center;gap:10px">
               <div style="width:32px;height:32px;background:var(--accent);border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:.85rem;flex-shrink:0">{initial}</div>
@@ -801,7 +800,6 @@ def search():
 
     <div style="display:flex;justify-content:space-between;margin-bottom:16px;flex-wrap:wrap;gap:8px">
     <input type="text" id="search-input" placeholder="Search by name, phone, address, postcode..." oninput="filterTable()" style="flex:1;min-width:200px;max-width:360px">
-    <input type="text" id="gas-search" placeholder="Filter by Usual Gas" oninput="filterTable()" style="min-width:180px;max-width:220px">
     </div>
 
     <div class="card" style="padding:0;overflow:hidden">
@@ -815,7 +813,6 @@ def search():
     <script>
     function filterTable() {{
     const q = document.getElementById("search-input").value.toLowerCase();
-    const gasQ = document.getElementById("gas-search").value.toLowerCase();
 
     document.querySelectorAll("#table-body tr").forEach(r => {{
         const name = r.dataset.name || "";
@@ -823,7 +820,6 @@ def search():
         const altPhone = phone.replace(/^0|^44|\\+/g,"");
         const addr = r.dataset.address || "";
         const postcode = r.dataset.postcode || "";
-        const gas = r.dataset.gas || "";
 
         const matchGeneral =
           name.includes(q) ||
@@ -831,9 +827,8 @@ def search():
           altPhone.includes(q) ||
           addr.includes(q) ||
           postcode.includes(q);
-        const matchGas = gas.includes(gasQ);
 
-        r.style.display = (matchGeneral && matchGas) ? "" : "none";
+        r.style.display = matchGeneral ? "" : "none";
     }});
     }}
     </script>'''
