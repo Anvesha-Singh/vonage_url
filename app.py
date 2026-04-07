@@ -58,7 +58,7 @@ def get_last_orders_bulk():
     conn = get_db()
     cur = conn.cursor()
     cur.execute("""
-        SELECT o.phone, STRING_AGG(oi.quantity || ' x ' || COALESCE(oi.custom_name, p.name), ', ') as summary
+        SELECT o.phone, STRING_AGG(oi.quantity || ' x ' || COALESCE(oi.custom_name, p.display_name, p.name), ', ') as summary
         FROM (
             SELECT DISTINCT ON (phone) id, phone
             FROM orders ORDER BY phone, order_date DESC, id DESC
@@ -78,7 +78,7 @@ def get_orders(phone, limit=None):
     conn = get_db()
     cur = conn.cursor()
     q = '''
-        SELECT o.id, o.order_date, o.delivery_date, o.notes, o.is_paid, p.name, oi.quantity, COALESCE(oi.custom_price, p.price) as price, oi.custom_name
+        SELECT o.id, o.order_date, o.delivery_date, o.notes, o.is_paid, p.name, oi.quantity, COALESCE(oi.custom_name, p.display_name, p.name) as product, COALESCE(oi.custom_price, p.price) as price, oi.custom_name
         FROM orders o
         JOIN order_items oi ON o.id = oi.order_id
         JOIN products p ON oi.product_id = p.id
@@ -803,7 +803,7 @@ def deliveries():
     # Fetch Orders
     cur.execute("""
         SELECT o.id, c.name, c.phone, c.address, c.town, c.postcode, o.notes, o.is_paid,
-               STRING_AGG(oi.quantity || ' x ' || COALESCE(oi.custom_name, p.name), ', ') as items
+               STRING_AGG(oi.quantity || ' x ' || COALESCE(oi.custom_name, p.display_name, p.name), ', ') as items
         FROM orders o
         JOIN customers c ON o.phone = c.phone
         JOIN order_items oi ON o.id = oi.order_id
@@ -835,7 +835,6 @@ def deliveries():
     for p in butane + propane:
         matrix_headers_2 += f"<td style='font-weight:bold; text-align:center;'>{p['display_name'] or p['name']}</td>"
 
-    # Removed "Out" row completely as requested
     row_in = "<td><strong>In</strong></td>" + "".join("<td></td>" for _ in butane + propane)
     row_delivered = "<td><strong>Out</strong></td>"
     row_truck = "<td><strong>Total on Truck</strong></td>"
@@ -873,6 +872,9 @@ def deliveries():
         tr {{ page-break-inside: avoid; page-break-after: auto; }}
         th, td {{ border: 1px solid #000 !important; color: black !important; padding: 6px !important; vertical-align: middle; }}
         .matrix-input {{ border: none !important; background: transparent !important; width: 100%; text-align: center; font-weight: bold; padding:0; }}
+        
+        /* Force the Matrix and Footer to a new page */
+        .matrix-container {{ page-break-before: always; break-before: page; }}
         
         /* Static Footer Styling */
         .footer-container {{ border: 2px solid #000; padding: 10px; margin-top: 20px; page-break-inside: avoid; }}
@@ -930,12 +932,15 @@ def deliveries():
                     <tr><th>Customer</th><th>Address</th><th>Order Items</th><th>Paid</th><th>Notes</th></tr>
                 </thead>
                 <tbody>
-                    {tr or '<tr><td colspan="5" style="text-align:center;padding:20px;">No deliveries.</td></tr>'}
+                    {tr}
+                    <tr><td>&nbsp;</td><td></td><td></td><td></td><td></td></tr>
+                    <tr><td>&nbsp;</td><td></td><td></td><td></td><td></td></tr>
+                    <tr><td>&nbsp;</td><td></td><td></td><td></td><td></td></tr>
                 </tbody>
             </table>
         </div>
         
-        <div class="card" style="padding:0;overflow:hidden;overflow-x:auto;">
+        <div class="card matrix-container" style="padding:0;overflow:hidden;overflow-x:auto;">
             <table style="min-width: 800px;">
                 <thead>
                     <tr>{matrix_headers_1}</tr>
@@ -1058,7 +1063,7 @@ def export_delivery_excel():
     
     cur.execute("""
         SELECT o.id, c.name, c.phone, c.address, c.town, c.postcode, o.notes, o.is_paid,
-               oi.quantity, COALESCE(oi.custom_name, p.name) as product_name, p.id as pid
+               oi.quantity, COALESCE(oi.custom_name, p.display_name, p.name) as product_name, p.id as pid
         FROM orders o
         JOIN customers c ON o.phone = c.phone
         JOIN order_items oi ON o.id = oi.order_id
@@ -1872,7 +1877,7 @@ def inventory():
         <h1 style="margin:0">Inventory & Products</h1>
         <button class="btn btn-ghost" onclick="enableEdit();return false;">✏️ Edit Current</button>
     </div>
-    <div class="card" style="padding:0;overflow:hidden;overflow-x:auto;">
+    <div class="card" style="padding:0;overflow:hidden;overflow-x:auto; page-break-before: always;">
         <form method="POST" style="margin:0">
             <table style="min-width: 1100px; font-size:0.95rem;">
                 <thead style="background:var(--surface)">
