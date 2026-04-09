@@ -390,6 +390,35 @@ def reload_cache():
     get_all_products.cache_clear()
     return redirect(request.referrer or "/search")
 
+@app.route("/delete_customer", methods=["POST"])
+@login_required
+def delete_customer():
+    phone = clean_phone(request.form.get("phone"))
+    if phone:
+        conn = get_db()
+        cur = conn.cursor()
+        
+        # 1. Grab all order IDs for this customer
+        cur.execute("SELECT id FROM orders WHERE phone = %s", (phone,))
+        order_ids = [row[0] for row in cur.fetchall()]
+
+        # 2. Delete all line items associated with those orders to satisfy foreign key constraints
+        if order_ids:
+            # We use ANY() to pass a list of order IDs to PostgreSQL
+            cur.execute("DELETE FROM order_items WHERE order_id = ANY(%s)", (order_ids,))
+            
+            # 3. Delete the actual orders
+            cur.execute("DELETE FROM orders WHERE phone = %s", (phone,))
+            
+        # 4. Finally, delete the customer profile
+        cur.execute("DELETE FROM customers WHERE phone = %s", (phone,))
+        
+        conn.commit()
+        cur.close()
+        conn.close()
+
+    return redirect("/search")
+
 @app.route("/update_delivery_date", methods=["POST"])
 @login_required
 def update_delivery_date():
@@ -612,6 +641,10 @@ def lookup():
                     <button class="btn btn-ghost" style="padding:6px 12px;font-size:0.85rem;flex:1;" onclick="getTravelTime('{user.get("postcode","")}')">📍 Calc Time</button> 
                     <a href="/edit_customer?phone={phone}" class="btn btn-ghost" style="padding:6px 12px;font-size:0.85rem;flex:1;text-align:center;">Edit Customer</a>
                 </div>
+                <form method="POST" action="/delete_customer" style="width:100%; margin-top:4px;" onsubmit="return confirm('WARNING: Are you sure you want to permanently delete this customer? This will also wipe all their historical order data.');">
+                    <input type="hidden" name="phone" value="{phone}">
+                    <button type="submit" class="btn btn-danger" style="width:100%; padding:6px 12px; font-size:0.85rem;">🗑️ Delete Customer</button>
+                </form>
                 <span id="travel-time" style="font-weight:bold;font-size:1rem;color:var(--text);width:100%;text-align:center;"></span>
             </div>
 
