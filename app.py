@@ -581,6 +581,10 @@ def login():
     '''
     return page("Login", body)
 
+import json
+from datetime import datetime
+from flask import request, redirect
+
 @app.route("/lookup")
 @login_required
 def lookup():
@@ -622,7 +626,7 @@ def lookup():
     initial = (user['name'] or '?')[0].upper()
     sched = get_delivery_schedule(user.get("town"))
 
-    # NEW: Fetch Special Prices if the customer is flagged
+    # Fetch Special Prices if the customer is flagged
     special_prices = {}
     if user.get("has_special_prices"):
         conn = get_db()
@@ -631,6 +635,17 @@ def lookup():
         for r in cur.fetchall():
             special_prices[str(r['product_id'])] = float(r['price'])
         cur.close(); conn.close()
+
+    # --- NEW: Build maps so JS can translate old order strings back into functional tiles ---
+    p_map = {}
+    d_prices = {}
+    for p in products:
+        pid = str(p['id'])
+        p_map[p['name']] = pid
+        if p.get('display_name'):
+            p_map[p['display_name']] = pid
+        d_prices[pid] = float(p['price'])
+    # -----------------------------------------------------------------------------------------
 
     # Orders List
     order_cards = ""
@@ -650,11 +665,14 @@ def lookup():
                 <span style="color:var(--muted);font-size:0.85rem;">Notes: {o["notes"] or 'None'}</span>
                 <strong style="font-size:1.1rem;">£{o["total"]:.2f}</strong>
             </div>
-            <form method="POST" action="/delete_order" style="margin-top:8px;text-align:right;">
-                <input type="hidden" name="order_id" value="{o["id"]}">
-                <input type="hidden" name="phone" value="{phone}">
-                <button class="btn btn-ghost" style="padding:4px 8px;font-size:0.8rem">Delete</button>
-            </form>
+            <div style="margin-top:8px; display:flex; justify-content:flex-end; gap:8px;">
+                <button type="button" class="btn btn-ghost" style="padding:4px 8px;font-size:0.8rem; color:var(--accent);" onclick="editOrder('{o["id"]}')">✏️ Edit</button>
+                <form method="POST" action="/delete_order" style="margin:0;">
+                    <input type="hidden" name="order_id" value="{o["id"]}">
+                    <input type="hidden" name="phone" value="{phone}">
+                    <button class="btn btn-ghost" style="padding:4px 8px;font-size:0.8rem">Delete</button>
+                </form>
+            </div>
         </div>
         '''
 
@@ -721,7 +739,7 @@ def lookup():
         </div>
 
         <div style="flex: 1 1 60%; min-width: 400px;" class="card">
-            <h3 style="margin-top:0; border-bottom:1px solid var(--border); padding-bottom:12px; margin-bottom:16px;">Select Products</h3>
+            <h3 id="form-title" style="margin-top:0; border-bottom:1px solid var(--border); padding-bottom:12px; margin-bottom:16px;">Select Products</h3>
             
             <div class="product-grid" style="grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); gap: 8px; margin-top:0;">
                 {tiles}
@@ -729,6 +747,7 @@ def lookup():
 
             <form method="POST" action="/save_order" id="order-form" style="margin-top:24px; border-top:1px solid var(--border); padding-top:20px;">
                 <input type="hidden" name="phone" value="{phone}">
+                <input type="hidden" name="order_id" id="edit-order-id" value="">
                 <input type="hidden" name="items" id="items-input">
 
                 <div style="display:flex;gap:12px;margin-bottom:12px;">
@@ -759,7 +778,10 @@ def lookup():
                     <h2 style="color:var(--success);margin:0;font-size:2.2rem;">£<span id="live-total">0.00</span></h2>
                 </div>
 
-                <button class="btn btn-primary" style="width:100%;font-size:1.2rem;padding:16px;margin-top:16px;" onclick="return prepareSubmit()">Save & Confirm Order</button>
+                <div style="display:flex; gap:12px; margin-top:16px;">
+                    <button type="button" id="cancel-edit-btn" class="btn btn-ghost" style="display:none; padding:16px; font-size:1.2rem;" onclick="cancelEdit()">Cancel Edit</button>
+                    <button type="submit" id="save-btn" class="btn btn-primary" style="flex:1; font-size:1.2rem; padding:16px;" onclick="return prepareSubmit()">Save & Confirm Order</button>
+                </div>
             </form>
         </div>
     </div>
@@ -786,8 +808,107 @@ def lookup():
     let total = 0.0;
     let pendingOtherId = null;
     
-    // NEW: Inject special prices from the backend directly into JS state
+    // Inject backend maps
     let customPrices = {json.dumps(special_prices)};
+    const productMap = {json.dumps(p_map)};
+    const defaultPrices = {json.dumps(d_prices)};
+    const recentOrders = {json.dumps({str(o['id']): o for o in orders[:5]}, default=str)};
+
+    function editOrder(orderId) {{
+        let o = recentOrders[orderId];
+        if(!o) return;
+
+        cancelEdit(); // Reset state before populating
+
+        // Change UI to Edit Mode
+        document.getElementById('form-title').innerText = "Editing Order #" + o.id;
+        document.getElementById('order-form').action = "/update_order";
+        document.getElementById('edit-order-id').value = o.id;
+
+        // Repopulate items robustly
+        if (o.items && Array.isArray(o.items)) {{
+            o.items.forEach(i => {{
+                // Fallback matching: try direct ID -> try mapping by name
+                let id = i.product_id || i.id || productMap[i.product]; 
+                if (!id) return; // Skip if we truly can't identify it
+
+                let pName = i.custom_name || i.product;
+                
+                // Fallback pricing: try historic price -> try special price -> try default price
+                let pPrice = i.price;
+                if (pPrice === undefined || pPrice === null) {{
+                    pPrice = customPrices[id] !== undefined ? customPrices[id] : defaultPrices[id];
+                }}
+                if (isNaN(pPrice)) pPrice = 0;
+
+                items[id] = {{qty: i.qty, price: pPrice, custom_name: pName}};
+                total += (pPrice * i.qty);
+
+                // Update Tile UI
+                let qtyEl = document.getElementById("qty-"+id);
+                if(qtyEl) {{
+                    qtyEl.textContent = items[id].qty;
+                    document.getElementById("tile-"+id).classList.add("selected");
+                    document.getElementById("reset-"+id).style.display = "block";
+                }}
+            }});
+        }}
+
+        document.getElementById("live-total").innerText = Math.max(0, total).toFixed(2);
+
+        // Safely extract dates (handle datetimes if DB passes them)
+        let oDate = o.date ? o.date.toString().substring(0, 10) : '';
+        let dDate = o.delivery_date ? o.delivery_date.toString().substring(0, 10) : '';
+
+        // Repopulate form inputs
+        document.querySelector('input[name="order_date"]').value = oDate;
+        document.querySelector('input[name="delivery_date"]').value = dDate;
+        document.querySelector('input[name="notes"]').value = o.notes || '';
+        document.querySelector('input[name="is_paid"]').checked = o.is_paid;
+
+        // Toggle Buttons
+        let saveBtn = document.getElementById('save-btn');
+        saveBtn.innerText = "Update Order";
+        saveBtn.style.background = "#eab308"; // Make it a warning color
+        saveBtn.style.color = "black";
+        document.getElementById('cancel-edit-btn').style.display = 'inline-block';
+        
+        // Scroll to order pad
+        document.getElementById('form-title').scrollIntoView({{behavior: "smooth"}});
+    }}
+
+    function cancelEdit() {{
+        // Wipe current tiles
+        for (let id in items) {{
+            let qtyEl = document.getElementById("qty-"+id);
+            if(qtyEl) qtyEl.textContent = "";
+            let tileEl = document.getElementById("tile-"+id);
+            if(tileEl) tileEl.classList.remove("selected");
+            let resetEl = document.getElementById("reset-"+id);
+            if(resetEl) resetEl.style.display = "none";
+        }}
+        
+        items = {{}};
+        total = 0.0;
+        document.getElementById("live-total").innerText = "0.00";
+
+        // Reset Inputs
+        document.querySelector('input[name="order_date"]').value = "{datetime.today().date()}";
+        document.querySelector('input[name="delivery_date"]').value = "{datetime.today().date()}";
+        document.querySelector('input[name="notes"]').value = "";
+        document.querySelector('input[name="is_paid"]').checked = false;
+        document.getElementById('edit-order-id').value = "";
+
+        // Reset UI
+        document.getElementById('form-title').innerText = "Select Products";
+        document.getElementById('order-form').action = "/save_order";
+        
+        let saveBtn = document.getElementById('save-btn');
+        saveBtn.innerText = "Save & Confirm Order";
+        saveBtn.style.background = "var(--primary)"; // Reset to normal primary color
+        saveBtn.style.color = "white";
+        document.getElementById('cancel-edit-btn').style.display = 'none';
+    }}
 
     async function setCustomPrice(id, defaultPrice) {{
         let current = customPrices[id] !== undefined ? customPrices[id] : defaultPrice;
@@ -805,7 +926,6 @@ def lookup():
             disp.style.fontWeight = "bold";
         }}
 
-        // NEW: Instantly save this new price to the database via API
         try {{
             await fetch('/api/set_special_price', {{
                 method: 'POST',
@@ -856,7 +976,6 @@ def lookup():
         if (name === 'Other') {{
             cPrice = items[id] ? items[id].price : price;
         }} else {{
-            // It will automatically use the special DB price if it was preloaded!
             cPrice = customPrices[id] !== undefined ? customPrices[id] : price;
         }}
         
@@ -875,9 +994,12 @@ def lookup():
     function resetTile(id) {{
         if(items[id]) total -= (items[id].price * items[id].qty);
         delete items[id];
-        document.getElementById("qty-"+id).textContent="";
-        document.getElementById("tile-"+id).classList.remove("selected");
-        document.getElementById("reset-"+id).style.display = "none";
+        let qtyEl = document.getElementById("qty-"+id);
+        if(qtyEl) qtyEl.textContent="";
+        let tileEl = document.getElementById("tile-"+id);
+        if(tileEl) tileEl.classList.remove("selected");
+        let resetEl = document.getElementById("reset-"+id);
+        if(resetEl) resetEl.style.display = "none";
         document.getElementById("live-total").innerText = Math.max(0, total).toFixed(2);
     }}
 
@@ -1148,6 +1270,65 @@ def save_order():
     conn.commit(); cur.close(); conn.close()
     return redirect(f"/lookup?phone={phone}")
 
+@app.route("/update_order", methods=["POST"])
+@login_required
+def update_order():
+    order_id = request.form.get("order_id")
+    phone = request.form.get("phone")
+    items_json = request.form.get("items", "{}")
+    order_date = request.form.get("order_date")
+    
+    delivery_date = request.form.get("delivery_date")
+    if not delivery_date or delivery_date.strip() == "":
+        delivery_date = None
+        
+    notes = request.form.get("notes", "")
+    is_paid = True if request.form.get("is_paid") else False
+
+    try:
+        items = json.loads(items_json)
+    except json.JSONDecodeError:
+        items = {}
+
+    if not order_id or not items:
+        return redirect(f"/lookup?phone={phone}")
+
+    conn = get_db()
+    cur = conn.cursor()
+    try:
+        # Update main order 
+        cur.execute("""
+            UPDATE orders 
+            SET order_date = %s, delivery_date = %s, notes = %s, is_paid = %s
+            WHERE id = %s
+        """, (order_date, delivery_date, notes, is_paid, order_id))
+        
+        # Wipe old items
+        cur.execute("DELETE FROM order_items WHERE order_id = %s", (order_id,))
+        
+        # Insert new items using CUSTOM_PRICE
+        for pid, info in items.items():
+            qty = int(info.get("qty", 0))
+            price = float(info.get("price", 0.0))
+            custom_name = info.get("custom_name")
+            
+            product_id = int(pid) if str(pid).isdigit() else None
+
+            cur.execute("""
+                INSERT INTO order_items (order_id, product_id, quantity, custom_price, custom_name)
+                VALUES (%s, %s, %s, %s, %s)
+            """, (order_id, product_id, qty, price, custom_name))
+        
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        print(f"CRITICAL ERROR updating order {order_id}: {e}")
+    finally:
+        cur.close()
+        conn.close()
+
+    return redirect(f"/lookup?phone={phone}")
+
 @app.route("/deliveries")
 @login_required
 def deliveries():
@@ -1197,10 +1378,15 @@ def deliveries():
     # Added a hidden form in a new Actions column to instantly update delivery date
     tr = "".join(f'''
         <tr class="delivery-row" data-postcode="{r['postcode'].strip() if r['postcode'] else ''}">
-            <td><strong>{r['name']}</strong><br><span style="font-family:'DM Mono',monospace;">0{r['phone']}</span></td>
+            <td>
+                <a href="/lookup?phone={r['phone']}" style="text-decoration:none; color:inherit; display:block;" title="Go to Customer Profile">
+                    <strong style="color:var(--accent);">{r['name']}</strong><br>
+                    <span style="font-family:'DM Mono',monospace; color:var(--muted);">0{r['phone']}</span>
+                </a>
+            </td>
             <td>{r['address']}<br>{r['town']}, {r['postcode']}</td>
-            <td style="font-weight:bold; color:var(--accent);">{r['items']}</td>
-            <td style="text-align:center; font-weight:bold; font-size:12pt;">{"✓" if r['is_paid'] else ""}</td>
+            <td style="font-weight:bold; color:var(--text);">{r['items']}</td>
+            <td style="text-align:center; font-weight:bold; font-size:12pt;">{"<span style='color:var(--success)'>✓</span>" if r['is_paid'] else ""}</td>
             <td>{r['notes'] or ''}</td>
             <td class="no-print">
                 <form method="POST" action="/update_delivery_date" style="display:flex; gap:6px; flex-direction:column;">
