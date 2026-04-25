@@ -65,7 +65,7 @@ def get_last_orders_bulk():
         ) latest
         JOIN orders o ON o.id = latest.id
         JOIN order_items oi ON o.id = oi.order_id
-        JOIN products p ON oi.product_id = p.id
+        JOIN products p ON oi.product_code = p.product_code
         GROUP BY o.phone
     """)
     rows = cur.fetchall()
@@ -78,10 +78,11 @@ def get_orders(phone, limit=None):
     conn = get_db()
     cur = conn.cursor()
     q = '''
-        SELECT o.id, o.order_date, o.delivery_date, o.notes, o.is_paid, p.name, oi.quantity, COALESCE(oi.custom_name, p.display_name, p.name) as product, COALESCE(oi.custom_price, p.price) as price, oi.custom_name
+        SELECT o.id, o.order_date, o.delivery_date, o.notes, o.is_paid, o.is_dispatched, o.is_delivered,
+               p.name, oi.quantity, COALESCE(oi.custom_name, p.display_name, p.name) as product, COALESCE(oi.custom_price, p.price) as price, oi.custom_name, p.product_code
         FROM orders o
         JOIN order_items oi ON o.id = oi.order_id
-        JOIN products p ON oi.product_id = p.id
+        JOIN products p ON oi.product_code = p.product_code
         WHERE o.phone = %s
         ORDER BY o.order_date DESC, o.id DESC
     '''
@@ -94,16 +95,15 @@ def get_orders(phone, limit=None):
     for r in rows:
         oid = r["id"]
         if oid not in orders:
-            orders[oid] = {"id": oid, "date": r["order_date"], "delivery_date": r["delivery_date"], "notes": r["notes"], "is_paid": r["is_paid"], "items": [], "total": 0}
+            orders[oid] = {"id": oid, "date": r["order_date"], "delivery_date": r["delivery_date"], "notes": r["notes"], "is_paid": r["is_paid"], "is_dispatched": r["is_dispatched"], "is_delivered": r["is_delivered"], "items": [], "total": 0}
         
         display_name = r["custom_name"] if r["custom_name"] else r["name"]
-        orders[oid]["items"].append({"product": display_name, "qty": r["quantity"]})
+        orders[oid]["items"].append({"product": display_name, "qty": r["quantity"], "product_code": r["product_code"], "price": r["price"], "custom_name": r["custom_name"]})
         orders[oid]["total"] += (float(r["price"]) or 0) * r["quantity"]
 
     return list(orders.values())
 
 def get_all_customers():
-    # Sorts by last order date, putting newest at the top
     conn = get_db()
     cur = conn.cursor()
     cur.execute("""
@@ -124,7 +124,7 @@ def get_products_sold(start, end):
         SELECT COALESCE(oi.custom_name, p.name) as name, SUM(oi.quantity) as qty, SUM(oi.quantity * COALESCE(oi.custom_price, p.price)) as revenue
         FROM order_items oi
         JOIN orders o ON oi.order_id = o.id
-        JOIN products p ON oi.product_id = p.id
+        JOIN products p ON oi.product_code = p.product_code
         WHERE o.order_date BETWEEN %s AND %s
         GROUP BY COALESCE(oi.custom_name, p.name)
         ORDER BY revenue DESC
@@ -163,19 +163,17 @@ def get_delivery_schedule(town):
 def get_daily_weather_sales(start, end):
     conn = get_db()
     cur = conn.cursor()
-    # Get daily sales grouped by gas type
     cur.execute("""
         SELECT o.order_date, p.gas_type, SUM(oi.quantity) as qty
         FROM orders o
         JOIN order_items oi ON o.id=oi.order_id
-        JOIN products p ON oi.product_id=p.id
+        JOIN products p ON oi.product_code=p.product_code
         WHERE o.order_date BETWEEN %s AND %s AND p.gas_type IN ('Butane', 'Propane')
         GROUP BY o.order_date, p.gas_type
     """, (start, end))
     rows = cur.fetchall()
     cur.close(); conn.close()
 
-    # Fetch weather for the requested date range using Open-Meteo (Swindon Coordinates)
     weather = {}
     try:
         url = f"https://api.open-meteo.com/v1/forecast?latitude=51.55&longitude=-1.78&start_date={start}&end_date={end}&daily=temperature_2m_mean&timezone=Europe/London"
@@ -184,11 +182,8 @@ def get_daily_weather_sales(start, end):
     except Exception as e:
         print(f"Weather API Error: {e}")
 
-    # Build the matched dataset
     sales_map = {(str(r["order_date"]), r["gas_type"]): int(r["qty"]) for r in rows}
     
-    # Ensure we have a continuous list of dates for the graph
-    from datetime import timedelta, datetime
     start_dt = datetime.strptime(start, "%Y-%m-%d").date()
     end_dt = datetime.strptime(end, "%Y-%m-%d").date()
     
@@ -200,41 +195,51 @@ def get_daily_weather_sales(start, end):
         data["dates"].append(d_str)
         data["butane"].append(sales_map.get((d_str, "Butane"), 0))
         data["propane"].append(sales_map.get((d_str, "Propane"), 0))
-        data["temp"].append(weather.get(d_str, None)) # None leaves a gap in the chart if API fails
+        data["temp"].append(weather.get(d_str, None)) 
         curr += timedelta(days=1)
 
     return data
 
-def get_today_revenue():
-    today = datetime.today().date()
+def get_period_revenue(start, end):
     conn = get_db()
     cur = conn.cursor()
     
-    # 1. Get matched revenue grouped by Order Type
+    # 1. Get matched revenue grouped by Order Type for the period
     cur.execute("""
         SELECT COALESCE(o.order_type, 'Delivery') as type, SUM(COALESCE(oi.custom_price, p.price) * oi.quantity)
-        FROM orders o JOIN order_items oi ON o.id=oi.order_id JOIN products p ON oi.product_id=p.id
-        WHERE o.order_date=%s
+        FROM orders o JOIN order_items oi ON o.id=oi.order_id JOIN products p ON oi.product_code=p.product_code
+        WHERE o.order_date BETWEEN %s AND %s
         GROUP BY o.order_type
-    """,(today,))
+    """,(start, end))
     results = {r[0]: float(r[1]) for r in cur.fetchall()}
     
-    # 2. Get Raw SumUp Total (Includes off-catalog)
-    cur.execute("SELECT SUM(amount) FROM sumup_payments WHERE DATE(created_at)=%s", (today,))
+    # 2. Get Raw SumUp Total for the period
+    cur.execute("SELECT SUM(amount) FROM sumup_payments WHERE DATE(created_at) BETWEEN %s AND %s", (start, end))
     raw_sumup = cur.fetchone()[0] or 0.0
     
+    # 3. Calculate driver expected cash for the period
+    cur.execute("""
+        SELECT SUM(COALESCE(oi.custom_price, p.price) * oi.quantity)
+        FROM orders o 
+        JOIN order_items oi ON o.id=oi.order_id 
+        JOIN products p ON oi.product_code=p.product_code
+        WHERE o.delivery_date BETWEEN %s AND %s 
+          AND o.is_paid IS NOT TRUE 
+          AND o.order_type = 'Delivery'
+    """, (start, end))
+    driver_cash = cur.fetchone()[0] or 0.0
+
     cur.close(); conn.close()
     
     orders = results.get('Delivery', 0)
     walkin = results.get('Walk-in', 0)
     sumup_matched = results.get('SumUp', 0)
     
-    return orders, walkin, sumup_matched, float(raw_sumup)
+    return orders, walkin, sumup_matched, float(raw_sumup), float(driver_cash)
 
 def predict_next_calls(days=3):
     conn = get_db()
     cur = conn.cursor()
-    # FIX: Group by date to prevent same-day orders from creating a 0-day interval
     cur.execute("SELECT phone, order_date FROM orders GROUP BY phone, order_date ORDER BY phone, order_date")
     rows = cur.fetchall()
     cur.close(); conn.close()
@@ -243,13 +248,12 @@ def predict_next_calls(days=3):
     data = defaultdict(list)
     for r in rows: data[r["phone"]].append(r["order_date"])
 
-    # WEATHER HEURISTIC: Grab the average temperature for the next 14 days
     try:
         w_url = "https://api.open-meteo.com/v1/forecast?latitude=51.55&longitude=-1.78&daily=temperature_2m_mean&forecast_days=14&timezone=Europe/London"
         temps = requests.get(w_url, timeout=3).json()["daily"]["temperature_2m_mean"]
         upcoming_avg_temp = sum(temps) / len(temps)
     except:
-        upcoming_avg_temp = 10.0 # Fallback UK baseline
+        upcoming_avg_temp = 10.0 
 
     predictions = {i: [] for i in range(days)}
     missed_calls = []
@@ -260,24 +264,14 @@ def predict_next_calls(days=3):
         diffs = [(dates[i]-dates[i-1]).days for i in range(1,len(dates))]
         base_avg = sum(diffs)/len(diffs)
 
-        # ADJUSTMENT LOGIC: 
-        # If the forecast drops below 10C, they burn gas faster. Shrink the interval.
-        # If it rises above 10C, they burn gas slower. Extend the interval.
-        # (2% adjustment per degree of deviation from baseline 10C)
         temp_diff = upcoming_avg_temp - 10.0 
         adjustment_factor = 1.0 + (temp_diff * 0.02)
-        
-        # Cap the adjustment so the math doesn't spiral out of control (Max 30% shift)
         adjustment_factor = max(0.7, min(1.3, adjustment_factor))
-        
         adjusted_avg = round(base_avg * adjustment_factor)
-        
-        # Ensure we always predict at least 1 day into the future
         next_date = dates[-1] + timedelta(days=max(1, adjusted_avg))
 
         cust = get_customer(phone)
         name = cust["name"] if cust else "Unknown"
-
         call_data = {"name": name, "phone": phone, "expected": str(next_date)}
 
         if next_date < today:
@@ -293,12 +287,12 @@ def get_inventory_status():
     conn = get_db()
     cur = conn.cursor()
     cur.execute("""
-        SELECT p.name, COALESCE(i.quantity,0) as stock, COALESCE(SUM(oi.quantity),0) as sold_last_week
+        SELECT p.name, p.product_code, COALESCE(i.quantity,0) as stock, COALESCE(SUM(oi.quantity),0) as sold_last_week
         FROM products p
-        LEFT JOIN inventory i ON p.id=i.product_id
-        LEFT JOIN order_items oi ON p.id=oi.product_id
+        LEFT JOIN inventory i ON p.product_code=i.product_code
+        LEFT JOIN order_items oi ON p.product_code=oi.product_code
         LEFT JOIN orders o ON oi.order_id=o.id AND o.order_date >= CURRENT_DATE - INTERVAL '7 days'
-        GROUP BY p.name, i.quantity
+        GROUP BY p.name, p.product_code, i.quantity
     """)
     rows = cur.fetchall()
     cur.close(); conn.close()
@@ -306,11 +300,10 @@ def get_inventory_status():
     result = []
     for r in rows:
         days_left = (r["stock"] / r["sold_last_week"]) * 7 if r["sold_last_week"] > 0 else None
-        result.append({"name": r["name"], "stock": r["stock"], "days_left": round(days_left,1) if days_left else None})
+        result.append({"name": r["name"], "code": r["product_code"], "stock": r["stock"], "days_left": round(days_left,1) if days_left else None})
     return result
 
 # ── Shared HTML assets ────────────────────────────────────────────────────────
-
 STYLE = """
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -422,6 +415,69 @@ def reload_cache():
     get_all_products.cache_clear()
     return redirect(request.referrer or "/search")
 
+@app.route("/api/toggle_delivery_status", methods=["POST"])
+@login_required
+def toggle_delivery_status():
+    data = request.json
+    order_id = data.get("order_id")
+    field = data.get("field") # 'is_dispatched' or 'is_delivered'
+    value = data.get("value")
+    
+    if order_id and field in ['is_dispatched', 'is_delivered']:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute(f"UPDATE orders SET {field} = %s WHERE id = %s", (value, order_id))
+        conn.commit()
+        cur.close(); conn.close()
+        return jsonify({"status": "success"})
+    return jsonify({"status": "error"}), 400
+
+@app.route("/roll_undelivered", methods=["POST"])
+@login_required
+def roll_undelivered():
+    target_date_str = request.form.get("date")
+    if not target_date_str: return redirect("/deliveries")
+    
+    target_date = datetime.strptime(target_date_str, "%Y-%m-%d").date()
+    
+    conn = get_db()
+    cur = conn.cursor()
+    
+    # FIX: Changed <= to = so it ONLY grabs orders specifically for this exact target_date
+    cur.execute("""
+        SELECT o.id, o.notes, c.town 
+        FROM orders o 
+        JOIN customers c ON o.phone = c.phone 
+        WHERE o.delivery_date = %s AND o.is_delivered = FALSE AND o.order_type = 'Delivery'
+    """, (target_date,))
+    orders_to_roll = cur.fetchall()
+    
+    days_map = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+    
+    for o in orders_to_roll:
+        sched = get_delivery_schedule(o['town'])
+        next_date = target_date + timedelta(days=1) 
+        
+        if sched and sched != "Unscheduled":
+            sched_days = [days_map.get(d.strip().lower()[:3]) for d in sched.split(",") if days_map.get(d.strip().lower()[:3]) is not None]
+            if sched_days:
+                for i in range(1, 8):
+                    check_date = target_date + timedelta(days=i)
+                    if check_date.weekday() in sched_days:
+                        next_date = check_date
+                        break
+        
+        new_notes = o['notes'] or ""
+        new_notes += f" [Rolled from {target_date_str}]"
+        
+        cur.execute("UPDATE orders SET delivery_date = %s, notes = %s, is_dispatched = FALSE WHERE id = %s", 
+                    (next_date, new_notes.strip(), o['id']))
+
+    conn.commit()
+    cur.close(); conn.close()
+    
+    return redirect(f"/deliveries?date={target_date_str}")
+
 @app.route("/delete_customer", methods=["POST"])
 @login_required
 def delete_customer():
@@ -429,25 +485,16 @@ def delete_customer():
     if phone:
         conn = get_db()
         cur = conn.cursor()
-        
-        # 1. Grab all order IDs for this customer
         cur.execute("SELECT id FROM orders WHERE phone = %s", (phone,))
         order_ids = [row[0] for row in cur.fetchall()]
 
-        # 2. Delete all line items associated with those orders to satisfy foreign key constraints
         if order_ids:
-            # We use ANY() to pass a list of order IDs to PostgreSQL
             cur.execute("DELETE FROM order_items WHERE order_id = ANY(%s)", (order_ids,))
-            
-            # 3. Delete the actual orders
             cur.execute("DELETE FROM orders WHERE phone = %s", (phone,))
             
-        # 4. Finally, delete the customer profile
         cur.execute("DELETE FROM customers WHERE phone = %s", (phone,))
-        
         conn.commit()
-        cur.close()
-        conn.close()
+        cur.close(); conn.close()
 
     return redirect("/search")
 
@@ -463,10 +510,8 @@ def update_delivery_date():
         cur = conn.cursor()
         cur.execute("UPDATE orders SET delivery_date = %s WHERE id = %s", (new_date, order_id))
         conn.commit()
-        cur.close()
-        conn.close()
+        cur.close(); conn.close()
 
-    # Bounce the user straight back to the run sheet they were just looking at
     return redirect(f"/deliveries?date={return_date}")
 
 @app.route("/api/optimize_route", methods=["POST"])
@@ -481,7 +526,6 @@ def optimize_route():
         return jsonify({"error": "ORS_API_KEY is missing from environment variables."}), 400
 
     try:
-        # 1. Translate UK Postcodes into GPS Coordinates (using free postcodes.io)
         all_pcs = [depot_postcode] + postcodes
         geo_req = requests.post("https://api.postcodes.io/postcodes", json={"postcodes": all_pcs})
         geo_data = geo_req.json().get("result", [])
@@ -489,7 +533,6 @@ def optimize_route():
         coords_map = {}
         for item in geo_data:
             if item and item.get("query") and item.get("result"):
-                # Clean spacing to ensure matches
                 pc_key = item["query"].replace(" ", "").upper()
                 coords_map[pc_key] = [item["result"]["longitude"], item["result"]["latitude"]]
 
@@ -497,7 +540,6 @@ def optimize_route():
         if depot_key not in coords_map:
             return jsonify({"error": "Could not locate depot coordinates."}), 400
 
-        # 2. Build the Jobs (Deliveries) payload for OpenRouteService
         jobs = []
         for i, pc in enumerate(postcodes):
             pc_key = pc.replace(" ", "").upper()
@@ -505,13 +547,12 @@ def optimize_route():
                 jobs.append({
                     "id": i + 1,
                     "location": coords_map[pc_key],
-                    "description": pc # Store postcode to retrieve it later
+                    "description": pc 
                 })
 
         if not jobs:
             return jsonify({"error": "Could not geocode any of the delivery postcodes."}), 400
 
-        # 3. Ask ORS to mathematically optimize the route (Round trip from depot)
         payload = {
             "vehicles": [{
                 "id": 1,
@@ -532,7 +573,6 @@ def optimize_route():
         if ors_res.status_code != 200:
             return jsonify({"error": "OpenRouteService failed to calculate.", "details": ors_res.text}), 500
 
-        # 4. Extract the newly optimized order
         routes = ors_res.json().get("routes", [])
         if not routes:
             return jsonify({"error": "No optimized route returned."}), 400
@@ -581,10 +621,6 @@ def login():
     '''
     return page("Login", body)
 
-import json
-from datetime import datetime
-from flask import request, redirect
-
 @app.route("/lookup")
 @login_required
 def lookup():
@@ -594,7 +630,6 @@ def lookup():
     if not phone:
         return page("Lookup", f'<div class="card" style="border-color:var(--danger)"><h2>Invalid number</h2><p>{raw}</p></div>')
 
-    # ALIAS INTERCEPTOR
     conn = get_db()
     cur = conn.cursor()
     try:
@@ -626,28 +661,24 @@ def lookup():
     initial = (user['name'] or '?')[0].upper()
     sched = get_delivery_schedule(user.get("town"))
 
-    # Fetch Special Prices if the customer is flagged
     special_prices = {}
     if user.get("has_special_prices"):
         conn = get_db()
         cur = conn.cursor()
-        cur.execute("SELECT product_id, price FROM customer_special_prices WHERE phone = %s", (phone,))
+        cur.execute("SELECT product_code, price FROM customer_special_prices WHERE phone = %s", (phone,))
         for r in cur.fetchall():
-            special_prices[str(r['product_id'])] = float(r['price'])
+            special_prices[str(r['product_code'])] = float(r['price'])
         cur.close(); conn.close()
 
-    # --- NEW: Build maps so JS can translate old order strings back into functional tiles ---
     p_map = {}
     d_prices = {}
     for p in products:
-        pid = str(p['id'])
+        pid = str(p['product_code'])
         p_map[p['name']] = pid
         if p.get('display_name'):
             p_map[p['display_name']] = pid
         d_prices[pid] = float(p['price'])
-    # -----------------------------------------------------------------------------------------
 
-    # Orders List
     order_cards = ""
     for o in orders[:5]:
         tags = "".join(f'<span style="background:var(--surface);border:1px solid var(--border);padding:4px 8px;border-radius:4px;margin-right:6px;display:inline-block;margin-bottom:4px;font-size:0.9rem;">{i["product"]} <strong style="color:var(--accent)">x{i["qty"]}</strong></span>' for i in o["items"])
@@ -678,28 +709,26 @@ def lookup():
 
     if not order_cards: order_cards = '<div class="card" style="text-align:center;color:var(--muted)">No previous orders.</div>'
 
-    # Product Tiles
     tiles = ""
     for p in products:
         bg_color = p.get('color', 'var(--surface)')
         safe_name = p["name"].replace("'", "\\'") 
         short_name = p.get("display_name") or p["name"] 
-        pid_str = str(p['id'])
+        pid_str = str(p['product_code'])
         
-        # Check if this specific product has a special price
         is_special = pid_str in special_prices
         display_price = special_prices[pid_str] if is_special else p["price"]
         price_style = "color:#eab308; font-weight:bold;" if is_special else ""
         
         tiles += f'''
-        <div class="product-tile" id="tile-{p["id"]}" style="background-color: {bg_color}; padding: 12px 8px; position:relative;" onclick="addQty('{p["id"]}', '{safe_name}', {p["price"]})">
+        <div class="product-tile" id="tile-{p["product_code"]}" style="background-color: {bg_color}; padding: 12px 8px; position:relative;" onclick="addQty('{p["product_code"]}', '{safe_name}', {p["price"]})">
             <div class="p-name" style="font-size:1rem;">{short_name}</div>
             <div style="font-size:0.9rem;color:var(--muted);margin-top:4px; display:flex; justify-content:center; align-items:center; gap:6px;">
-                £<span id="price-display-{p['id']}" style="{price_style}">{display_price}</span>
-                <span onclick="event.stopPropagation(); setCustomPrice('{p['id']}', {display_price})" style="cursor:pointer; font-size:0.85rem;" title="Edit Special Price">✏️</span>
+                £<span id="price-display-{p['product_code']}" style="{price_style}">{display_price}</span>
+                <span onclick="event.stopPropagation(); setCustomPrice('{p['product_code']}', {display_price})" style="cursor:pointer; font-size:0.85rem;" title="Edit Special Price">✏️</span>
             </div>
-            <div class="p-qty" id="qty-{p["id"]}" style="font-size:1.6rem; min-height:1.8rem; margin-top:6px;"></div>
-            <span style="position:absolute;top:6px;right:6px;font-size:1.2rem;color:var(--danger);display:none;cursor:pointer;background:var(--bg);border-radius:50%;width:24px;height:24px;line-height:24px;" id="reset-{p["id"]}" onclick="event.stopPropagation();resetTile('{p["id"]}')">&#x2715;</span>
+            <div class="p-qty" id="qty-{p["product_code"]}" style="font-size:1.6rem; min-height:1.8rem; margin-top:6px;"></div>
+            <span style="position:absolute;top:6px;right:6px;font-size:1.2rem;color:var(--danger);display:none;cursor:pointer;background:var(--bg);border-radius:50%;width:24px;height:24px;line-height:24px;" id="reset-{p["product_code"]}" onclick="event.stopPropagation();resetTile('{p["product_code"]}')">&#x2715;</span>
         </div>
         '''
 
@@ -707,7 +736,6 @@ def lookup():
     <div style="display:flex;gap:24px;align-items:flex-start;flex-wrap:wrap;">
 
         <div style="flex: 1 1 35%; min-width: 320px; display:flex; flex-direction:column; gap:24px;">
-            
             <div class="card customer-hero" style="flex-direction:column; align-items:flex-start; gap:16px; padding:24px;">
                 <div style="display:flex; align-items:center; gap:16px; width:100%;">
                     <div class="avatar" style="width:56px; height:56px; font-size:1.5rem;">{initial}</div>
@@ -731,7 +759,6 @@ def lookup():
                 </form>
                 <span id="travel-time" style="font-weight:bold;font-size:1rem;color:var(--text);width:100%;text-align:center;"></span>
             </div>
-
             <div>
                 <h3 style="margin-bottom:12px;">Last Orders</h3>
                 {order_cards}
@@ -740,11 +767,9 @@ def lookup():
 
         <div style="flex: 1 1 60%; min-width: 400px;" class="card">
             <h3 id="form-title" style="margin-top:0; border-bottom:1px solid var(--border); padding-bottom:12px; margin-bottom:16px;">Select Products</h3>
-            
             <div class="product-grid" style="grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); gap: 8px; margin-top:0;">
                 {tiles}
             </div>
-
             <form method="POST" action="/save_order" id="order-form" style="margin-top:24px; border-top:1px solid var(--border); padding-top:20px;">
                 <input type="hidden" name="phone" value="{phone}">
                 <input type="hidden" name="order_id" id="edit-order-id" value="">
@@ -808,7 +833,6 @@ def lookup():
     let total = 0.0;
     let pendingOtherId = null;
     
-    // Inject backend maps
     let customPrices = {json.dumps(special_prices)};
     const productMap = {json.dumps(p_map)};
     const defaultPrices = {json.dumps(d_prices)};
@@ -818,23 +842,17 @@ def lookup():
         let o = recentOrders[orderId];
         if(!o) return;
 
-        cancelEdit(); // Reset state before populating
-
-        // Change UI to Edit Mode
+        cancelEdit(); 
         document.getElementById('form-title').innerText = "Editing Order #" + o.id;
         document.getElementById('order-form').action = "/update_order";
         document.getElementById('edit-order-id').value = o.id;
 
-        // Repopulate items robustly
         if (o.items && Array.isArray(o.items)) {{
             o.items.forEach(i => {{
-                // Fallback matching: try direct ID -> try mapping by name
-                let id = i.product_id || i.id || productMap[i.product]; 
-                if (!id) return; // Skip if we truly can't identify it
+                let id = i.product_code || productMap[i.product]; 
+                if (!id) return; 
 
                 let pName = i.custom_name || i.product;
-                
-                // Fallback pricing: try historic price -> try special price -> try default price
                 let pPrice = i.price;
                 if (pPrice === undefined || pPrice === null) {{
                     pPrice = customPrices[id] !== undefined ? customPrices[id] : defaultPrices[id];
@@ -844,7 +862,6 @@ def lookup():
                 items[id] = {{qty: i.qty, price: pPrice, custom_name: pName}};
                 total += (pPrice * i.qty);
 
-                // Update Tile UI
                 let qtyEl = document.getElementById("qty-"+id);
                 if(qtyEl) {{
                     qtyEl.textContent = items[id].qty;
@@ -855,30 +872,23 @@ def lookup():
         }}
 
         document.getElementById("live-total").innerText = Math.max(0, total).toFixed(2);
-
-        // Safely extract dates (handle datetimes if DB passes them)
         let oDate = o.date ? o.date.toString().substring(0, 10) : '';
         let dDate = o.delivery_date ? o.delivery_date.toString().substring(0, 10) : '';
 
-        // Repopulate form inputs
         document.querySelector('input[name="order_date"]').value = oDate;
         document.querySelector('input[name="delivery_date"]').value = dDate;
         document.querySelector('input[name="notes"]').value = o.notes || '';
         document.querySelector('input[name="is_paid"]').checked = o.is_paid;
 
-        // Toggle Buttons
         let saveBtn = document.getElementById('save-btn');
         saveBtn.innerText = "Update Order";
-        saveBtn.style.background = "#eab308"; // Make it a warning color
+        saveBtn.style.background = "#eab308"; 
         saveBtn.style.color = "black";
         document.getElementById('cancel-edit-btn').style.display = 'inline-block';
-        
-        // Scroll to order pad
         document.getElementById('form-title').scrollIntoView({{behavior: "smooth"}});
     }}
 
     function cancelEdit() {{
-        // Wipe current tiles
         for (let id in items) {{
             let qtyEl = document.getElementById("qty-"+id);
             if(qtyEl) qtyEl.textContent = "";
@@ -892,20 +902,18 @@ def lookup():
         total = 0.0;
         document.getElementById("live-total").innerText = "0.00";
 
-        // Reset Inputs
         document.querySelector('input[name="order_date"]').value = "{datetime.today().date()}";
         document.querySelector('input[name="delivery_date"]').value = "{datetime.today().date()}";
         document.querySelector('input[name="notes"]').value = "";
         document.querySelector('input[name="is_paid"]').checked = false;
         document.getElementById('edit-order-id').value = "";
 
-        // Reset UI
         document.getElementById('form-title').innerText = "Select Products";
         document.getElementById('order-form').action = "/save_order";
         
         let saveBtn = document.getElementById('save-btn');
         saveBtn.innerText = "Save & Confirm Order";
-        saveBtn.style.background = "var(--primary)"; // Reset to normal primary color
+        saveBtn.style.background = "var(--primary)"; 
         saveBtn.style.color = "white";
         document.getElementById('cancel-edit-btn').style.display = 'none';
     }}
@@ -1056,21 +1064,18 @@ def lookup():
 def set_special_price():
     data = request.json
     phone = data.get("phone")
-    pid = data.get("product_id")
+    pid = data.get("product_id") 
     price = data.get("price")
     
     if phone and pid is not None and price is not None:
         conn = get_db()
         cur = conn.cursor()
         
-        # 1. Auto-flag the customer as having special prices
         cur.execute("UPDATE customers SET has_special_prices = TRUE WHERE phone = %s", (phone,))
-        
-        # 2. Save or update the specific product price
         cur.execute("""
-            INSERT INTO customer_special_prices (phone, product_id, price)
+            INSERT INTO customer_special_prices (phone, product_code, price)
             VALUES (%s, %s, %s)
-            ON CONFLICT (phone, product_id) DO UPDATE SET price = EXCLUDED.price
+            ON CONFLICT (phone, product_code) DO UPDATE SET price = EXCLUDED.price
         """, (phone, pid, price))
         
         conn.commit()
@@ -1090,8 +1095,6 @@ def link_customer():
 
         conn = get_db()
         cur = conn.cursor()
-        
-        # We insert the new number into the customers table, but flag it as an alias
         cur.execute("""
             INSERT INTO customers (phone, name, is_alias_for)
             VALUES (%s, %s, %s)
@@ -1101,14 +1104,9 @@ def link_customer():
         conn.commit()
         cur.close()
         conn.close()
-
-        # Redirect to the master profile
         return redirect(f"/lookup?phone={primary_phone}")
 
-    # For the GET request, grab all customers so they can pick the master account
     customers = get_all_customers()
-    
-    # Filter out aliases so you don't accidentally link an alias to another alias
     opts = "".join(f'<option value="{c["phone"]}">0{c["phone"]} - {c["name"]} ({c["postcode"]})</option>' for c in customers if not c.get('is_alias_for'))
 
     body = f'''
@@ -1120,14 +1118,11 @@ def link_customer():
         <form method="POST">
             <input type="hidden" name="alias_phone" value="{alias_phone}">
             <label style="display:block;margin-bottom:8px;font-weight:bold;color:var(--muted)">Select Master Customer Account</label>
-            
             <input type="text" id="search-master" class="modern-input" placeholder="🔍 Type name, phone, or postcode to filter..." style="margin-bottom: 8px;">
-            
             <select name="primary_phone" id="master-select" class="modern-input" required style="height: 50px;">
                 <option value="">-- Choose Customer --</option>
                 {opts}
             </select>
-            
             <div style="display:flex; justify-content:flex-end; gap:12px; margin-top:24px;">
                 <a href="/lookup?phone={alias_phone}" class="btn btn-ghost">Cancel</a>
                 <button type="submit" class="btn btn-primary">🔗 Link Number</button>
@@ -1141,11 +1136,7 @@ def link_customer():
         
         document.getElementById('search-master').addEventListener('input', function(e) {{
             const term = e.target.value.toLowerCase();
-            
-            // Clear current options
             select.innerHTML = '';
-            
-            // Add back only the options that match the search term
             allOptions.forEach(opt => {{
                 if(opt.value === "" || opt.text.toLowerCase().includes(term)) {{
                     select.appendChild(opt);
@@ -1167,19 +1158,16 @@ def travel_time():
     headers = {"User-Agent": "SleemansCRM/1.0"}
 
     try:
-        # Step 1: Geocode Base
         base_url = f"https://nominatim.openstreetmap.org/search?postalcode={base_postcode}&country=UK&format=json"
         r_base = requests.get(base_url, headers=headers).json()
         if not r_base: return jsonify({"time": "Base origin not found"})
         base_coords = f"{r_base[0]['lon']},{r_base[0]['lat']}"
 
-        # Step 2: Geocode Destination
         dest_url = f"https://nominatim.openstreetmap.org/search?postalcode={dest}&country=UK&format=json"
         r_dest = requests.get(dest_url, headers=headers).json()
         if not r_dest: return jsonify({"time": "Dest postcode not found"})
         dest_coords = f"{r_dest[0]['lon']},{r_dest[0]['lat']}"
 
-        # Step 3: Route via OSRM
         osrm_url = f"http://router.project-osrm.org/route/v1/driving/{base_coords};{dest_coords}?overview=false"
         r_route = requests.get(osrm_url).json()
 
@@ -1197,30 +1185,27 @@ def travel_time():
 
         return jsonify({"time": time_str})
     except Exception as e:
-        print(f"Routing Error: {e}")
         return jsonify({"time": "API Error"})
 
 @app.route("/delete_order", methods=["POST"])
 @login_required
 def delete_order():
     oid = request.form.get("order_id")
-    phone = request.form.get("phone") # Phone is optional (used for redirect routing)
+    phone = request.form.get("phone") 
 
     conn = get_db()
     cur = conn.cursor()
     
-    # 1. Find the items so we can restore the stock
-    cur.execute("SELECT product_id, quantity FROM order_items WHERE order_id=%s", (oid,))
+    cur.execute("SELECT product_code, quantity FROM order_items WHERE order_id=%s", (oid,))
     items = cur.fetchall()
     
-    # 2. Add quantities BACK to inventory
     for item in items:
-        cur.execute("""
-            INSERT INTO inventory (product_id, quantity) VALUES (%s, %s)
-            ON CONFLICT (product_id) DO UPDATE SET quantity = inventory.quantity + EXCLUDED.quantity
-        """, (item['product_id'], item['quantity']))
+        if item['product_code']:
+            cur.execute("""
+                INSERT INTO inventory (product_code, quantity) VALUES (%s, %s)
+                ON CONFLICT (product_code) DO UPDATE SET quantity = inventory.quantity + EXCLUDED.quantity
+            """, (item['product_code'], item['quantity']))
 
-    # 3. Delete the order
     cur.execute("DELETE FROM order_items WHERE order_id=%s", (oid,))
     cur.execute("DELETE FROM orders WHERE id=%s", (oid,))
     conn.commit()
@@ -1228,7 +1213,7 @@ def delete_order():
 
     if phone:
         return redirect(f"/lookup?phone={phone}")
-    return redirect("/cash") # Fallback to POS page
+    return redirect("/cash") 
 
 @app.route("/save_order", methods=["POST"])
 @login_required
@@ -1258,14 +1243,13 @@ def save_order():
 
     for pid, data in items.items():
         qty = int(data['qty'])
-        # 1. Save to order
-        cur.execute("INSERT INTO order_items (order_id, product_id, quantity, custom_name, custom_price) VALUES (%s,%s,%s,%s,%s)",
-                    (oid, int(pid), qty, data.get('custom_name'), data.get('price')))
-        # 2. Subtract from Inventory (uses a negative UPSERT so it works even if stock was blank)
+        prod_code = pid if not str(pid).isdigit() else f"SKU-{pid}" # Handle transition
+        cur.execute("INSERT INTO order_items (order_id, product_code, quantity, custom_name, custom_price) VALUES (%s,%s,%s,%s,%s)",
+                    (oid, pid, qty, data.get('custom_name'), data.get('price')))
         cur.execute("""
-            INSERT INTO inventory (product_id, quantity) VALUES (%s, %s)
-            ON CONFLICT (product_id) DO UPDATE SET quantity = inventory.quantity + EXCLUDED.quantity
-        """, (int(pid), -qty))
+            INSERT INTO inventory (product_code, quantity) VALUES (%s, %s)
+            ON CONFLICT (product_code) DO UPDATE SET quantity = inventory.quantity + EXCLUDED.quantity
+        """, (pid, -qty))
 
     conn.commit(); cur.close(); conn.close()
     return redirect(f"/lookup?phone={phone}")
@@ -1296,28 +1280,23 @@ def update_order():
     conn = get_db()
     cur = conn.cursor()
     try:
-        # Update main order 
         cur.execute("""
             UPDATE orders 
             SET order_date = %s, delivery_date = %s, notes = %s, is_paid = %s
             WHERE id = %s
         """, (order_date, delivery_date, notes, is_paid, order_id))
         
-        # Wipe old items
         cur.execute("DELETE FROM order_items WHERE order_id = %s", (order_id,))
         
-        # Insert new items using CUSTOM_PRICE
         for pid, info in items.items():
             qty = int(info.get("qty", 0))
             price = float(info.get("price", 0.0))
             custom_name = info.get("custom_name")
             
-            product_id = int(pid) if str(pid).isdigit() else None
-
             cur.execute("""
-                INSERT INTO order_items (order_id, product_id, quantity, custom_price, custom_name)
+                INSERT INTO order_items (order_id, product_code, quantity, custom_price, custom_name)
                 VALUES (%s, %s, %s, %s, %s)
-            """, (order_id, product_id, qty, price, custom_name))
+            """, (order_id, pid, qty, price, custom_name))
         
         conn.commit()
     except Exception as e:
@@ -1338,46 +1317,44 @@ def deliveries():
     conn = get_db()
     cur = conn.cursor()
     
-    # Fetch Gas Products
-    cur.execute("SELECT id, display_name, name, gas_type, COALESCE(net_weight, 0) as net, COALESCE(gross_weight, 0) as gross FROM products WHERE gas_type IN ('Butane', 'Propane') ORDER BY sort_order ASC, name ASC")
+    cur.execute("SELECT product_code as id, display_name, name, gas_type, COALESCE(net_weight, 0) as net, COALESCE(gross_weight, 0) as gross FROM products WHERE gas_type IN ('Butane', 'Propane') ORDER BY sort_order ASC, name ASC")
     gas_products = [dict(r) for r in cur.fetchall()]
     butane = [p for p in gas_products if p['gas_type'] == 'Butane']
     propane = [p for p in gas_products if p['gas_type'] == 'Propane']
     
-    # Calculate Delivered Qtys for base load
     cur.execute("""
-        SELECT p.id, SUM(oi.quantity) as qty
-        FROM orders o JOIN order_items oi ON o.id = oi.order_id JOIN products p ON oi.product_id = p.id
+        SELECT p.product_code as id, SUM(oi.quantity) as qty
+        FROM orders o JOIN order_items oi ON o.id = oi.order_id JOIN products p ON oi.product_code = p.product_code
         WHERE o.delivery_date = %s AND p.gas_type IN ('Butane', 'Propane')
-        GROUP BY p.id
+        GROUP BY p.product_code
     """, (target_date,))
     delivered_map = {str(r['id']): r['qty'] for r in cur.fetchall()}
     
-    # Fetch Orders
     cur.execute("""
-        SELECT o.id, c.name, c.phone, c.address, c.town, c.postcode, o.notes, o.is_paid,
+        SELECT o.id, c.name, c.phone, c.address, c.town, c.postcode, o.notes, o.is_paid, o.is_dispatched, o.is_delivered,
                STRING_AGG(oi.quantity || ' x ' || COALESCE(oi.custom_name, p.display_name, p.name), ', ') as items
         FROM orders o
         JOIN customers c ON o.phone = c.phone
         JOIN order_items oi ON o.id = oi.order_id
-        JOIN products p ON oi.product_id = p.id
-        WHERE o.delivery_date = %s
-        GROUP BY o.id, c.name, c.phone, c.address, c.town, c.postcode, o.notes, o.is_paid
+        JOIN products p ON oi.product_code = p.product_code
+        WHERE o.delivery_date = %s AND o.order_type = 'Delivery'
+        GROUP BY o.id, c.name, c.phone, c.address, c.town, c.postcode, o.notes, o.is_paid, o.is_dispatched, o.is_delivered
         ORDER BY c.town, c.name
     """, (target_date,))
     rows = cur.fetchall()
     cur.close(); conn.close()
 
-    # Extract unique postcodes for the Routing button
     unique_postcodes = []
     for r in rows:
         pc = r['postcode'].strip() if r['postcode'] else ""
         if pc and pc not in unique_postcodes:
             unique_postcodes.append(pc)
 
-    # Added a hidden form in a new Actions column to instantly update delivery date
     tr = "".join(f'''
-        <tr class="delivery-row" data-postcode="{r['postcode'].strip() if r['postcode'] else ''}">
+        <tr class="delivery-row" data-postcode="{r['postcode'].strip() if r['postcode'] else ''}" data-dispatched="{str(r['is_dispatched']).lower()}">
+            <td class="no-print" style="text-align:center;">
+                <input type="checkbox" class="checkbox-lg" {"checked" if r['is_dispatched'] else ""} onchange="toggleStatus({r['id']}, 'is_dispatched', this.checked)">
+            </td>
             <td>
                 <a href="/lookup?phone={r['phone']}" style="text-decoration:none; color:inherit; display:block;" title="Go to Customer Profile">
                     <strong style="color:var(--accent);">{r['name']}</strong><br>
@@ -1388,6 +1365,9 @@ def deliveries():
             <td style="font-weight:bold; color:var(--text);">{r['items']}</td>
             <td style="text-align:center; font-weight:bold; font-size:12pt;">{"<span style='color:var(--success)'>✓</span>" if r['is_paid'] else ""}</td>
             <td>{r['notes'] or ''}</td>
+            <td class="no-print" style="text-align:center;">
+                <input type="checkbox" class="checkbox-lg" {"checked" if r['is_delivered'] else ""} onchange="toggleStatus({r['id']}, 'is_delivered', this.checked)">
+            </td>
             <td class="no-print">
                 <form method="POST" action="/update_delivery_date" style="display:flex; gap:6px; flex-direction:column;">
                     <input type="hidden" name="order_id" value="{r['id']}">
@@ -1399,7 +1379,6 @@ def deliveries():
         </tr>
     ''' for r in rows)
 
-    # Matrix Headers
     matrix_headers_1 = f"<th></th>"
     if butane: matrix_headers_1 += f"<th colspan='{len(butane)}' style='background:#fde68a; color:black; text-align:center;'>Butane (UN 1011)</th>"
     if propane: matrix_headers_1 += f"<th colspan='{len(propane)}' style='background:#fca5a5; color:black; text-align:center;'>Propane (UN 1978)</th>"
@@ -1428,15 +1407,8 @@ def deliveries():
 
     body = f'''
     <style>
-    /* REMOVE ARROWS FROM NUMBER INPUTS */
-    input[type=number]::-webkit-outer-spin-button,
-    input[type=number]::-webkit-inner-spin-button {{
-        -webkit-appearance: none;
-        margin: 0;
-    }}
-    input[type=number] {{
-        -moz-appearance: textfield;
-    }}
+    input[type=number]::-webkit-outer-spin-button, input[type=number]::-webkit-inner-spin-button {{ -webkit-appearance: none; margin: 0; }}
+    input[type=number] {{ -moz-appearance: textfield; }}
 
     @media print {{
         @page {{ size: landscape; margin: 10mm; }}
@@ -1444,18 +1416,14 @@ def deliveries():
         nav, .no-print {{ display: none !important; }}
         .print-only {{ display: block !important; }}
         .print-table-row {{ display: table-row !important; }}
-        
         * {{ font-size: 10pt !important; }}
         h2 {{ font-size: 14pt !important; margin: 0 0 10px 0 !important; }}
-        
         .card {{ border: none !important; padding: 0 !important; background: transparent !important; box-shadow: none !important; margin-bottom: 20px !important; }}
         table {{ border: 1px solid #000 !important; width: 100%; border-collapse: collapse; page-break-inside: auto; }}
         tr {{ page-break-inside: avoid; page-break-after: auto; }}
         th, td {{ border: 1px solid #000 !important; color: black !important; padding: 6px !important; vertical-align: middle; }}
         .matrix-input {{ border: none !important; background: transparent !important; width: 100%; text-align: center; font-weight: bold; padding:0; }}
-        
         .matrix-container {{ page-break-before: always; break-before: page; }}
-        
         .footer-container {{ border: 2px solid #000; padding: 10px; margin-top: 20px; page-break-inside: avoid; }}
         .footer-grid-3 {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 15px; border-bottom: 1px dashed #000; padding-bottom: 10px; margin-bottom: 10px; }}
         .footer-grid-2 {{ display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 15px; }}
@@ -1465,17 +1433,29 @@ def deliveries():
     .empty-row td {{ height: 50px; }}
     </style>
     
-    <div class="no-print" style="margin-bottom: 24px;">
+    <div class="no-print" style="margin-bottom: 24px; display:flex; justify-content:space-between; align-items:flex-end;">
         <h1 style="margin-bottom:16px;">Deliveries / Run Sheet</h1>
+        <form method="POST" action="/roll_undelivered" onsubmit="return confirm('Roll forward all undispatched/undelivered orders for {target_date} to the next available day?');">
+            <input type="hidden" name="date" value="{target_date}">
+            <button class="btn btn-warning" style="background:#eab308; color:#000; border:none; margin-bottom:16px;">▶️ Roll Undelivered to Next Day</button>
+        </form>
     </div>
 
     <form id="run-form" action="/export_delivery_excel" method="GET">
         <div class="card no-print" style="display:flex; gap:20px; align-items:flex-end; flex-wrap:wrap; margin-bottom:24px;">
-            <div style="flex:1; min-width:180px;">
-                <label style="font-weight:bold;color:var(--muted);display:block;margin-bottom:8px;">Delivery Date:</label>
+            <div style="flex:1; min-width:140px;">
+                <label style="font-weight:bold;color:var(--muted);display:block;margin-bottom:8px;">Date:</label>
                 <input type="date" name="date" class="modern-input" value="{target_date}" style="margin:0;" onchange="window.location.href='/deliveries?date='+this.value">
             </div>
-            <div style="flex:2; min-width:180px;">
+            <div style="flex:1; min-width:140px;">
+                <label style="font-weight:bold;color:var(--muted);display:block;margin-bottom:8px;">Print Filter:</label>
+                <select id="dispatch-filter" class="modern-input" style="margin:0; padding:12px;" onchange="filterDeliveries()">
+                    <option value="all">Show All</option>
+                    <option value="undispatched">Only Undispatched</option>
+                    <option value="dispatched">Only Dispatched</option>
+                </select>
+            </div>
+            <div style="flex:2; min-width:140px;">
                 <label style="font-weight:bold;color:var(--muted);display:block;margin-bottom:8px;">Driver Name:</label>
                 <select id="driver_input" name="driver" class="modern-input" style="margin:0; padding:12px;">
                     <option value="Craig Batterton">Craig Batterton</option>
@@ -1483,7 +1463,7 @@ def deliveries():
                     <option value="Rajesh Singh">Rajesh Singh</option>
                 </select>
             </div>
-            <div style="flex:2; min-width:180px;">
+            <div style="flex:2; min-width:140px;">
                 <label style="font-weight:bold;color:var(--muted);display:block;margin-bottom:8px;">Vehicle Reg:</label>
                 <select id="vehicle_input" name="vehicle_reg" class="modern-input" style="margin:0; padding:12px;">
                     <option value="DU14 EWG">DU14 EWG</option>
@@ -1491,7 +1471,7 @@ def deliveries():
                 </select>
             </div>
             <div style="display:flex; gap:12px; align-items:flex-end;">
-                <button type="button" id="route-btn" class="btn btn-primary" onclick="calculateRoute()" style="background:#8b5cf6;height:48px; border:none; min-width:150px;">🗺️ Auto-Sort Route</button>
+                <button type="button" id="route-btn" class="btn btn-primary" onclick="calculateRoute()" style="background:#8b5cf6;height:48px; border:none; min-width:150px;">🗺️ Auto-Sort</button>
                 <button type="button" class="btn btn-ghost" onclick="triggerPrint()" style="height:48px;">🖨️ Print</button>
                 <button type="submit" class="btn btn-primary" style="background:var(--success);height:48px;">📊 Excel</button>
             </div>
@@ -1501,7 +1481,7 @@ def deliveries():
             <table>
                 <thead style="background:var(--surface)">
                     <tr class="print-table-row">
-                        <td colspan="6" style="border:none !important; border-bottom:2px solid #000 !important; padding-bottom:10px !important;">
+                        <td colspan="8" style="border:none !important; border-bottom:2px solid #000 !important; padding-bottom:10px !important;">
                             <h2 style="margin:0 0 5px 0;">Delivery Run Sheet</h2>
                             <div style="font-weight: bold; display:flex; justify-content:space-between;">
                                 <span>Date: {target_date} <span style="font-weight:normal;">(Printed: <span id="print_time"></span>)</span></span>
@@ -1510,13 +1490,21 @@ def deliveries():
                             </div>
                         </td>
                     </tr>
-                    <tr><th>Customer</th><th>Address</th><th>Order Items</th><th>Paid</th><th>Notes</th><th class="no-print">Actions</th></tr>
+                    <tr>
+                        <th class="no-print" style="text-align:center;">Dispatched</th>
+                        <th>Customer</th>
+                        <th>Address</th>
+                        <th>Order Items</th>
+                        <th>Paid</th>
+                        <th>Notes</th>
+                        <th class="no-print" style="text-align:center;">Delivered</th>
+                        <th class="no-print">Actions</th>
+                    </tr>
                 </thead>
                 <tbody id="deliveries-tbody">
-                    {tr or '<tr><td colspan="6" style="text-align:center;padding:20px;">No deliveries.</td></tr>'}
-                    <tr class="empty-row"><td>&nbsp;</td><td></td><td></td><td></td><td></td><td class="no-print"></td></tr>
-                    <tr class="empty-row"><td>&nbsp;</td><td></td><td></td><td></td><td></td><td class="no-print"></td></tr>
-                    <tr class="empty-row"><td>&nbsp;</td><td></td><td></td><td></td><td></td><td class="no-print"></td></tr>
+                    {tr or '<tr><td colspan="8" style="text-align:center;padding:20px;">No deliveries.</td></tr>'}
+                    <tr class="empty-row"><td class="no-print"></td><td>&nbsp;</td><td></td><td></td><td></td><td></td><td class="no-print"></td><td class="no-print"></td></tr>
+                    <tr class="empty-row"><td class="no-print"></td><td>&nbsp;</td><td></td><td></td><td></td><td></td><td class="no-print"></td><td class="no-print"></td></tr>
                 </tbody>
             </table>
         </div>
@@ -1547,23 +1535,19 @@ def deliveries():
             <div>
                 <strong>SHIPPING NAME:</strong> PROPANE and/or BUTANE<br>
                 <strong>CLASSIFICATION:</strong> CLASS 2.1<br>
-                <strong>UN NUMBER/S:</strong> UN 1978 (PROPANE) & UN 1011 (BUTANE)<br>
-                <strong>TRANSPORT CATEGORY:</strong> CATEGORY 2 'EXTREMELY FLAMMABLE'
+                <strong>UN NUMBER/S:</strong> UN 1978 (PROPANE) & UN 1011 (BUTANE)
             </div>
             <div>
                 <strong>CONSIGNOR:</strong> FLO GAS Ltd<br>
                 <strong>CONSIGNEE:</strong> AS Per delivery address shown above<br>
-                <strong>QUANTITIES:</strong> AS Per quantities on customer address<br>
                 <strong>EMERGENCY ACTION CODE:</strong> 2YE
             </div>
             <div style="text-align:center;">
                 <strong>SLEEMANS</strong><br>
                 154 SWINDON RD<br>
-                STRATTON SWINDON WILTS.<br>
-                SN3 4PN &nbsp;&nbsp;|&nbsp;&nbsp; phone 01793 822087
+                STRATTON SWINDON WILTS.
             </div>
         </div>
-        
         <div>
             <div style="font-weight:bold; margin-bottom: 10px;">THERE ARE NO TEMPERATURE CONTROL CONSIDERATIONS.</div>
             <div class="footer-grid-2">
@@ -1575,6 +1559,35 @@ def deliveries():
 
     <script>
     const pData = {json.dumps(js_data)};
+
+    async function toggleStatus(orderId, field, value) {{
+        try {{
+            await fetch('/api/toggle_delivery_status', {{
+                method: 'POST',
+                headers: {{'Content-Type': 'application/json'}},
+                body: JSON.stringify({{order_id: orderId, field: field, value: value}})
+            }});
+            if (field === 'is_dispatched') {{
+                // Update row attr for filtering
+                let checkbox = document.querySelector(`input[onchange*="${{orderId}}"][onchange*="is_dispatched"]`);
+                if(checkbox) checkbox.closest('tr').setAttribute('data-dispatched', value.toString());
+            }}
+        }} catch(e) {{
+            console.error("Failed to update status");
+        }}
+    }}
+
+    function filterDeliveries() {{
+        let filterVal = document.getElementById('dispatch-filter').value;
+        let rows = document.querySelectorAll('.delivery-row');
+        rows.forEach(row => {{
+            let isDisp = row.getAttribute('data-dispatched') === 'true';
+            if (filterVal === 'all') row.style.display = '';
+            else if (filterVal === 'dispatched' && isDisp) row.style.display = '';
+            else if (filterVal === 'undispatched' && !isDisp) row.style.display = '';
+            else row.style.display = 'none';
+        }});
+    }}
 
     function calcMatrix() {{
         let totalNet = 0.0;
@@ -1592,16 +1605,6 @@ def deliveries():
                 
                 totalNet += net;
                 totalGross += gross;
-                
-                let hidden = document.getElementById('hidden_truck_' + pid);
-                if(!hidden) {{
-                    hidden = document.createElement('input');
-                    hidden.type = 'hidden';
-                    hidden.id = 'hidden_truck_' + pid;
-                    hidden.name = 'truck_' + pid;
-                    document.getElementById('run-form').appendChild(hidden);
-                }}
-                hidden.value = qty;
             }}
         }}
         
@@ -1613,69 +1616,41 @@ def deliveries():
 
     function triggerPrint() {{
         const now = new Date();
-        const timeString = now.toLocaleTimeString([], {{hour: '2-digit', minute:'2-digit'}});
-        document.getElementById('print_time').innerText = timeString;
-
-        const drivers = document.querySelectorAll('#print_driver');
-        const vehicles = document.querySelectorAll('#print_vehicle');
-        const selDriver = document.getElementById('driver_input').value;
-        const selVehicle = document.getElementById('vehicle_input').value;
-        
-        drivers.forEach(d => d.innerText = selDriver);
-        vehicles.forEach(v => v.innerText = selVehicle);
-        
+        document.getElementById('print_time').innerText = now.toLocaleTimeString([], {{hour: '2-digit', minute:'2-digit'}});
+        document.querySelectorAll('#print_driver').forEach(d => d.innerText = document.getElementById('driver_input').value);
+        document.querySelectorAll('#print_vehicle').forEach(v => v.innerText = document.getElementById('vehicle_input').value);
         window.print();
     }}
 
     async function calculateRoute() {{
         const postcodes = {json.dumps(unique_postcodes)};
-        if (postcodes.length === 0) {{
-            alert("No postcodes found for today's deliveries to route.");
-            return;
-        }}
-        
+        if (postcodes.length === 0) return alert("No postcodes found.");
         const btn = document.getElementById('route-btn');
         const originalText = btn.innerText;
-        btn.innerText = "⏳ Optimizing...";
-        btn.disabled = true;
+        btn.innerText = "⏳ Optimizing..."; btn.disabled = true;
 
         try {{
             let res = await fetch('/api/optimize_route', {{
-                method: 'POST',
-                headers: {{'Content-Type': 'application/json'}},
+                method: 'POST', headers: {{'Content-Type': 'application/json'}},
                 body: JSON.stringify({{postcodes: postcodes}})
             }});
-            
             let data = await res.json();
-            
-            if (data.error) {{
-                alert("Optimization Failed: " + data.error);
-                btn.innerText = originalText;
-                btn.disabled = false;
-                return;
-            }}
+            if (data.error) throw new Error(data.error);
 
             const tbody = document.getElementById('deliveries-tbody');
             const rows = Array.from(tbody.querySelectorAll('.delivery-row'));
             const emptyRows = Array.from(tbody.querySelectorAll('.empty-row'));
 
             data.optimized.forEach(optPostcode => {{
-                const matchingRows = rows.filter(row => row.getAttribute('data-postcode') === optPostcode);
-                matchingRows.forEach(row => tbody.appendChild(row));
+                rows.filter(row => row.getAttribute('data-postcode') === optPostcode).forEach(row => tbody.appendChild(row));
             }});
-            
             emptyRows.forEach(row => tbody.appendChild(row));
 
             btn.innerText = "✅ Sorted!";
-            setTimeout(() => {{
-                btn.innerText = originalText;
-                btn.disabled = false;
-            }}, 3000);
-
+            setTimeout(() => {{ btn.innerText = originalText; btn.disabled = false; }}, 3000);
         }} catch (e) {{
-            alert("Network error while trying to calculate route.");
-            btn.innerText = originalText;
-            btn.disabled = false;
+            alert("Optimization Failed: " + e.message);
+            btn.innerText = originalText; btn.disabled = false;
         }}
     }}
     </script>
@@ -1692,19 +1667,19 @@ def export_delivery_excel():
     conn = get_db()
     cur = conn.cursor()
     
-    cur.execute("SELECT id, display_name, name, gas_type, COALESCE(net_weight, 0) as net, COALESCE(gross_weight, 0) as gross FROM products WHERE gas_type IN ('Butane', 'Propane') ORDER BY sort_order ASC, name ASC")
+    cur.execute("SELECT product_code as id, display_name, name, gas_type, COALESCE(net_weight, 0) as net, COALESCE(gross_weight, 0) as gross FROM products WHERE gas_type IN ('Butane', 'Propane') ORDER BY sort_order ASC, name ASC")
     gas_products = [dict(r) for r in cur.fetchall()]
     butane = [p for p in gas_products if p['gas_type'] == 'Butane']
     propane = [p for p in gas_products if p['gas_type'] == 'Propane']
     
     cur.execute("""
         SELECT o.id, c.name, c.phone, c.address, c.town, c.postcode, o.notes, o.is_paid,
-               oi.quantity, COALESCE(oi.custom_name, p.display_name, p.name) as product_name, p.id as pid
+               oi.quantity, COALESCE(oi.custom_name, p.display_name, p.name) as product_name, p.product_code as pid
         FROM orders o
         JOIN customers c ON o.phone = c.phone
         JOIN order_items oi ON o.id = oi.order_id
-        JOIN products p ON oi.product_id = p.id
-        WHERE o.delivery_date = %s
+        JOIN products p ON oi.product_code = p.product_code
+        WHERE o.delivery_date = %s AND o.order_type = 'Delivery'
         ORDER BY c.town, c.name
     """, (target_date,))
     rows = cur.fetchall()
@@ -1736,7 +1711,6 @@ def export_delivery_excel():
     for cell in ws[1]: cell.font = Font(bold=True, size=14)
     ws.append([])
     
-    # 1. Orders Table
     headers = ["Customer", "Phone", "Address", "Order Items", "Status", "Notes"]
     ws.append(headers)
     for cell in ws[3]: cell.font = Font(bold=True)
@@ -1747,7 +1721,6 @@ def export_delivery_excel():
     ws.append([])
     ws.append([])
     
-    # 2. Matrix Table
     start_row = ws.max_row + 1
     
     h1 = [""]
@@ -1764,7 +1737,6 @@ def export_delivery_excel():
     row_deliv = ["Delivered"] + [delivered_map.get(str(p['id']), 0) for p in butane + propane]
     ws.append(row_deliv)
     
-    # Grab the manual input from the web form request
     row_truck = ["Total on Truck"]
     row_net = ["Net Wt (tons)"]
     row_gross = ["Gross Wt (tons)"]
@@ -1793,7 +1765,6 @@ def export_delivery_excel():
     ws.append(["Total Net Wt:", round(total_net, 3)])
     ws.append(["Total Gross Wt:", round(total_gross, 3)])
     
-    # Styling for Excel Matrix
     for r in range(start_row, ws.max_row + 1):
         for cell in ws[r]:
             if cell.column == 1 or r <= start_row + 1:
@@ -1867,7 +1838,6 @@ def search():
     last_orders_map = get_last_orders_bulk()
     products = get_all_products()
 
-    # Create filter checkboxes for every product
     prod_opts = "".join(f'''
         <label style="margin-right:20px; display:inline-flex; align-items:center; cursor:pointer; font-weight:600; padding:6px 0;">
             <input type="checkbox" value="{(p.get('display_name') or p.get('name') or '').lower()}" class="prod-filter checkbox-lg"> {(p.get('display_name') or p.get('title') or '')}
@@ -1948,14 +1918,12 @@ def search():
         }});
     }}
 
-    // Toggle dropdown and prevent event bubbling
     function toggleDropdown(e) {{
         e.stopPropagation();
         const drop = document.getElementById('filter-dropdown');
         drop.style.display = drop.style.display === 'none' ? 'block' : 'none';
     }}
 
-    // Close when clicking outside of the dropdown
     document.addEventListener('click', function(e) {{
         const drop = document.getElementById('filter-dropdown');
         if (drop && drop.style.display === 'block' && !drop.contains(e.target)) {{
@@ -2089,7 +2057,6 @@ def edit_customer():
 @app.route("/analytics")
 @login_required
 def analytics():
-    # Default to viewing the last 14 days for better weather graphing context
     today_dt = datetime.today().date()
     default_start = (today_dt - timedelta(days=14)).strftime("%Y-%m-%d")
     today_str = today_dt.strftime("%Y-%m-%d")
@@ -2102,11 +2069,10 @@ def analytics():
     inventory = get_inventory_status()
     weather_data = get_daily_weather_sales(start, end)
 
-    orders_rev, walkin_rev, sumup_matched_rev, raw_sumup_rev = get_today_revenue()
+    orders_rev, walkin_rev, sumup_matched_rev, raw_sumup_rev, driver_cash = get_period_revenue(start, end)
     total_matched = orders_rev + walkin_rev + sumup_matched_rev
     true_total = orders_rev + walkin_rev + raw_sumup_rev
 
-    # Graph 1 Data (Bottle Quantities)
     prod_labels = [p['name'] for p in products_sold]
     prod_qtys = [int(p['qty']) for p in products_sold]
     period_rev = sum([float(p['revenue']) for p in products_sold])
@@ -2115,7 +2081,7 @@ def analytics():
     for i in inventory:
         inventory_html += f'''
         <div style="background:var(--bg);padding:16px;border-radius:8px;border:1px solid var(--border)">
-            <strong style="font-size:1.1rem;display:block;margin-bottom:8px;">{i["name"]}</strong>
+            <strong style="font-size:1.1rem;display:block;margin-bottom:8px;">{i["name"]} <span style="font-size:0.8rem; color:var(--muted)">({i["code"]})</span></strong>
             <span style="font-family:'DM Mono',monospace;font-size:1.2rem;color:var(--accent)">{i["stock"]} left</span>
         </div>
         '''
@@ -2174,20 +2140,30 @@ def analytics():
 
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:24px">
 
-        <div class="card">
-            <h3 style="margin-bottom:16px;">Total Bottles Sold (By Type)</h3>
-            <div style="position:relative; height:300px; width:100%;">
-                <canvas id="bottles-chart"></canvas>
+        <div class="card" style="border-color: var(--accent); border-width: 2px;">
+            <h3 style="margin-bottom:8px; color: var(--accent);">🚚 Driver End-of-Day Collection</h3>
+            <div style="color:var(--muted);margin-bottom:16px;font-size:0.95rem;">
+                Estimated cash driver should return with today (Excludes pre-paid).
+            </div>
+            <div style="font-size: 3rem; font-weight: bold; color: var(--text); text-align: center; margin-top: 20px;">
+                £{driver_cash:.2f}
             </div>
         </div>
         
         <div class="card" style="border-color: var(--success); border-width: 2px;">
             <h3 style="margin-bottom:8px; color: var(--success);">Today's Revenue Split (£{true_total:.2f})</h3>
             <div style="color:var(--text);margin-bottom:16px;font-size:0.95rem; font-weight:bold;">
-                Matched System: £{total_matched:.2f} | Total SumUp: £{raw_sumup_rev:.2f}
+                Tap & Pay Total (SumUp): £{raw_sumup_rev:.2f}
             </div>
-            <div style="position:relative; height:250px; width:100%; display:flex; justify-content:center;">
+            <div style="position:relative; height:200px; width:100%; display:flex; justify-content:center;">
                 <canvas id="revenue-split"></canvas>
+            </div>
+        </div>
+
+        <div class="card" style="grid-column:1 / span 2">
+            <h3 style="margin-bottom:16px;">Total Bottles Sold (By Type)</h3>
+            <div style="position:relative; height:300px; width:100%;">
+                <canvas id="bottles-chart"></canvas>
             </div>
         </div>
 
@@ -2254,7 +2230,6 @@ def analytics():
     }}
     document.addEventListener("DOMContentLoaded", hideDismissedRows);
 
-    // Graph 1: Simple Bottle Qty
     new Chart(document.getElementById('bottles-chart'), {{
         type: 'bar',
         data: {{
@@ -2268,7 +2243,6 @@ def analytics():
         options: {{ responsive: true, maintainAspectRatio: false }}
     }});
 
-    // Graph 2: Weather Correlation (Mixed Chart)
     const weatherData = {json.dumps(weather_data)};
     new Chart(document.getElementById('weather-correlation'), {{
         type: 'bar',
@@ -2288,13 +2262,13 @@ def analytics():
                 {{
                     label: 'Propane Sold',
                     data: weatherData.propane,
-                    backgroundColor: '#fca5a5', // Light red to match Propane tag
+                    backgroundColor: '#fca5a5', 
                     yAxisID: 'yQty'
                 }},
                 {{
                     label: 'Butane Sold',
                     data: weatherData.butane,
-                    backgroundColor: '#fde68a', // Yellow to match Butane tag
+                    backgroundColor: '#fde68a', 
                     yAxisID: 'yQty'
                 }}
             ]
@@ -2320,7 +2294,6 @@ def analytics():
         }}
     }});
 
-    // Graph 3: Revenue Split
     new Chart(document.getElementById('revenue-split'), {{
         type: 'doughnut',
         data: {{
@@ -2348,7 +2321,7 @@ def download_customers():
 
     if not rows: return "No data"
     
-    dict_rows = [dict(r) for r in rows] # Cast to standard dicts
+    dict_rows = [dict(r) for r in rows] 
     si = io.StringIO()
     writer = csv.DictWriter(si, fieldnames=list(dict_rows[0].keys()))
     writer.writeheader()
@@ -2368,7 +2341,7 @@ def download_orders():
                COALESCE(oi.custom_price, p.price) as unit_price
         FROM orders o
         JOIN order_items oi ON o.id = oi.order_id
-        JOIN products p ON oi.product_id = p.id
+        JOIN products p ON oi.product_code = p.product_code
         WHERE o.order_date BETWEEN %s AND %s
         ORDER BY o.order_date DESC
     """,(start,end))
@@ -2377,7 +2350,7 @@ def download_orders():
 
     if not rows: return "No data for this period"
 
-    dict_rows = [dict(r) for r in rows] # Cast to standard dicts
+    dict_rows = [dict(r) for r in rows] 
     si = io.StringIO()
     writer = csv.DictWriter(si, fieldnames=list(dict_rows[0].keys()))
     writer.writeheader()
@@ -2391,14 +2364,13 @@ def cash():
     conn = get_db()
     cur = conn.cursor()
     
-    # Fetch recent POS / SumUp orders
     cur.execute("""
         SELECT o.id, o.order_type, o.order_date, o.notes,
                COALESCE(STRING_AGG(oi.quantity || ' x ' || COALESCE(oi.custom_name, p.name), ', '), o.notes) as items,
                 COALESCE(SUM(oi.quantity * COALESCE(oi.custom_price, p.price)), 0) as total
         FROM orders o
         LEFT JOIN order_items oi ON o.id = oi.order_id
-        JOIN products p ON oi.product_id = p.id
+        JOIN products p ON oi.product_code = p.product_code
         WHERE o.order_type IN ('Walk-in', 'SumUp')
         GROUP BY o.id, o.order_type, o.order_date, o.notes
         ORDER BY o.id DESC LIMIT 15
@@ -2413,14 +2385,14 @@ def cash():
         short_name = p.get("display_name") or p["name"] 
         
         tiles += f'''
-        <div class="product-tile" id="tile-{p["id"]}" style="background-color: {bg_color}; padding: 12px 8px; position:relative;" onclick="addQty('{p["id"]}', '{safe_name}', {p["price"]})">
+        <div class="product-tile" id="tile-{p["product_code"]}" style="background-color: {bg_color}; padding: 12px 8px; position:relative;" onclick="addQty('{p["product_code"]}', '{safe_name}', {p["price"]})">
             <div class="p-name" style="font-size:1rem;">{short_name}</div>
             <div style="font-size:0.9rem;color:var(--muted);margin-top:4px; display:flex; justify-content:center; align-items:center; gap:6px;">
-                £<span id="price-display-{p['id']}">{p["price"]}</span>
-                <span onclick="event.stopPropagation(); setCustomPrice('{p['id']}', {p['price']})" style="cursor:pointer; font-size:0.85rem;" title="Give Discount">✏️</span>
+                £<span id="price-display-{p['product_code']}">{p["price"]}</span>
+                <span onclick="event.stopPropagation(); setCustomPrice('{p['product_code']}', {p['price']})" style="cursor:pointer; font-size:0.85rem;" title="Give Discount">✏️</span>
             </div>
-            <div class="p-qty" id="qty-{p["id"]}" style="font-size:1.6rem; min-height:1.8rem; margin-top:6px;"></div>
-            <span style="position:absolute;top:6px;right:6px;font-size:1.2rem;color:var(--danger);display:none;cursor:pointer;background:var(--bg);border-radius:50%;width:24px;height:24px;line-height:24px;" id="reset-{p["id"]}" onclick="event.stopPropagation();resetTile('{p["id"]}')">&#x2715;</span>
+            <div class="p-qty" id="qty-{p["product_code"]}" style="font-size:1.6rem; min-height:1.8rem; margin-top:6px;"></div>
+            <span style="position:absolute;top:6px;right:6px;font-size:1.2rem;color:var(--danger);display:none;cursor:pointer;background:var(--bg);border-radius:50%;width:24px;height:24px;line-height:24px;" id="reset-{p["product_code"]}" onclick="event.stopPropagation();resetTile('{p["product_code"]}')">&#x2715;</span>
         </div>
         '''
 
@@ -2449,7 +2421,6 @@ def cash():
 
             <form method="POST" action="/save_walkin" id="order-form" style="margin-top:24px; border-top:1px solid var(--border); padding-top:20px;">
                 <input type="hidden" name="items" id="items-input">
-                
                 <input type="text" name="notes" class="modern-input" placeholder="Optional Notes..." style="margin-bottom:16px;">
 
                 <div style="display:flex;justify-content:space-between;align-items:center; background:var(--bg); padding:16px; border-radius:8px; border:1px solid var(--border);">
@@ -2539,17 +2510,6 @@ def cash():
     '''
     return page("POS", body, wide=True)
 
-@app.route("/delete_cash", methods=["POST"])
-@login_required
-def delete_cash():
-    cid = request.form.get("id")
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM cash_payments WHERE id=%s", (cid,))
-    conn.commit()
-    cur.close(); conn.close()
-    return redirect("/cash")
-
 @app.route("/inventory", methods=["GET","POST"])
 @login_required
 def inventory():
@@ -2560,30 +2520,31 @@ def inventory():
         for k, v in request.form.items():
             if k.startswith("qty_"):
                 pid = k.split("_")[1]
-                cur.execute("INSERT INTO inventory (product_id, quantity) VALUES (%s, %s) ON CONFLICT (product_id) DO UPDATE SET quantity=%s", (pid, v, v))
+                cur.execute("INSERT INTO inventory (product_code, quantity) VALUES (%s, %s) ON CONFLICT (product_code) DO UPDATE SET quantity=%s", (pid, v, v))
             elif k.startswith("price_"):
                 pid = k.split("_")[1]
-                cur.execute("UPDATE products SET price=%s WHERE id=%s", (v, pid))
+                cur.execute("UPDATE products SET price=%s WHERE product_code=%s", (v, pid))
             elif k.startswith("color_"):
                 pid = k.split("_")[1]
-                cur.execute("UPDATE products SET color=%s WHERE id=%s", (v, pid))
+                cur.execute("UPDATE products SET color=%s WHERE product_code=%s", (v, pid))
             elif k.startswith("net_"):
                 pid = k.split("_")[1]
-                cur.execute("UPDATE products SET net_weight=%s WHERE id=%s", (v or 0, pid))
+                cur.execute("UPDATE products SET net_weight=%s WHERE product_code=%s", (v or 0, pid))
             elif k.startswith("gross_"):
                 pid = k.split("_")[1]
-                cur.execute("UPDATE products SET gross_weight=%s WHERE id=%s", (v or 0, pid))
+                cur.execute("UPDATE products SET gross_weight=%s WHERE product_code=%s", (v or 0, pid))
             elif k.startswith("gas_"):
                 pid = k.split("_")[1]
-                cur.execute("UPDATE products SET gas_type=%s WHERE id=%s", (v if v in ['Butane', 'Propane'] else None, pid))
+                cur.execute("UPDATE products SET gas_type=%s WHERE product_code=%s", (v if v in ['Butane', 'Propane'] else None, pid))
             elif k.startswith("display_"):
                 pid = k.split("_")[1]
-                cur.execute("UPDATE products SET display_name=%s WHERE id=%s", (v or None, pid))
+                cur.execute("UPDATE products SET display_name=%s WHERE product_code=%s", (v or None, pid))
             elif k.startswith("sort_"):
                 pid = k.split("_")[1]
-                cur.execute("UPDATE products SET sort_order=%s WHERE id=%s", (v or 0, pid))
+                cur.execute("UPDATE products SET sort_order=%s WHERE product_code=%s", (v or 0, pid))
 
-        if "new_name" in request.form and request.form["new_name"].strip():
+        if "new_code" in request.form and request.form["new_code"].strip():
+            code = request.form["new_code"].strip()
             name = request.form["new_name"].strip()
             display = request.form.get("new_display") or None
             price = request.form.get("new_price") or 0
@@ -2595,31 +2556,27 @@ def inventory():
             gtype = gtype if gtype in ['Butane', 'Propane'] else None
             sort_order = request.form.get("new_sort") or 0
             
-            cur.execute("INSERT INTO products (name, display_name, price, color, net_weight, gross_weight, gas_type, sort_order) VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id", (name, display, price, color, net, gross, gtype, sort_order))
-            new_pid = cur.fetchone()["id"]
-            cur.execute("INSERT INTO inventory (product_id, quantity) VALUES (%s,%s)", (new_pid, qty))
+            cur.execute("INSERT INTO products (product_code, name, display_name, price, color, net_weight, gross_weight, gas_type, sort_order) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING", (code, name, display, price, color, net, gross, gtype, sort_order))
+            cur.execute("INSERT INTO inventory (product_code, quantity) VALUES (%s,%s) ON CONFLICT DO NOTHING", (code, qty))
 
         if "delete_pid" in request.form:
             pid = request.form["delete_pid"]
             try:
-                # 1. Attempt a complete physical delete (Works for untouched mistakes)
-                cur.execute("DELETE FROM inventory WHERE product_id=%s", (pid,))
-                cur.execute("DELETE FROM products WHERE id=%s", (pid,))
+                cur.execute("DELETE FROM inventory WHERE product_code=%s", (pid,))
+                cur.execute("DELETE FROM products WHERE product_code=%s", (pid,))
                 conn.commit() 
             except Exception:
-                # 2. If Postgres blocks it due to historical receipts, gracefully Archive it instead
-                conn.rollback() # Reset the transaction
-                cur.execute("UPDATE products SET is_active = FALSE WHERE id=%s", (pid,))
-                cur.execute("DELETE FROM inventory WHERE product_id=%s", (pid,)) # Clear its remaining stock
+                conn.rollback() 
+                cur.execute("UPDATE products SET is_active = FALSE WHERE product_code=%s", (pid,))
+                cur.execute("DELETE FROM inventory WHERE product_code=%s", (pid,)) 
 
         conn.commit()
         if hasattr(get_all_products, 'cache_clear'): get_all_products.cache_clear()
 
-    # Note the new `WHERE p.is_active = TRUE` filter here
     cur.execute("""
-        SELECT p.id, p.name, p.display_name, p.price, p.color, COALESCE(p.net_weight,0) as net, COALESCE(p.gross_weight,0) as gross, p.gas_type, COALESCE(p.sort_order,0) as sort_order, COALESCE(i.quantity,0) as qty
+        SELECT p.product_code, p.name, p.display_name, p.price, p.color, COALESCE(p.net_weight,0) as net, COALESCE(p.gross_weight,0) as gross, p.gas_type, COALESCE(p.sort_order,0) as sort_order, COALESCE(i.quantity,0) as qty
         FROM products p
-        LEFT JOIN inventory i ON p.id=i.product_id
+        LEFT JOIN inventory i ON p.product_code=i.product_code
         WHERE p.is_active = TRUE
         ORDER BY p.sort_order ASC, p.name ASC
     """)
@@ -2628,22 +2585,23 @@ def inventory():
 
     table_rows = "".join(f'''
         <tr>
-            <td><input type="number" name="sort_{r['id']}" value="{r['sort_order']}" class="modern-input" style="background:var(--bg);margin:0;width:60px;padding:8px;" disabled></td>
-            <td><input type="text" name="name_{r['id']}" value="{r['name']}" class="modern-input" style="background:var(--bg);margin:0;padding:8px;" disabled></td>
-            <td><input type="text" name="display_{r['id']}" value="{r['display_name'] or ''}" placeholder="Short" class="modern-input" style="background:var(--bg);margin:0;padding:8px;" disabled></td>
+            <td><input type="number" name="sort_{r['product_code']}" value="{r['sort_order']}" class="modern-input" style="background:var(--bg);margin:0;width:60px;padding:8px;" disabled></td>
+            <td style="font-weight:bold; font-family:'DM Mono',monospace;">{r['product_code']}</td>
+            <td><input type="text" name="name_{r['product_code']}" value="{r['name']}" class="modern-input" style="background:var(--bg);margin:0;padding:8px;" disabled></td>
+            <td><input type="text" name="display_{r['product_code']}" value="{r['display_name'] or ''}" placeholder="Short" class="modern-input" style="background:var(--bg);margin:0;padding:8px;" disabled></td>
             <td>
-                <select name="gas_{r['id']}" class="modern-input" style="background:var(--bg);margin:0;padding:8px;" disabled>
+                <select name="gas_{r['product_code']}" class="modern-input" style="background:var(--bg);margin:0;padding:8px;" disabled>
                     <option value="" {"selected" if not r['gas_type'] else ""}>Other</option>
                     <option value="Butane" {"selected" if r['gas_type'] == 'Butane' else ""}>Butane</option>
                     <option value="Propane" {"selected" if r['gas_type'] == 'Propane' else ""}>Propane</option>
                 </select>
             </td>
-            <td><input type="number" name="price_{r['id']}" value="{r['price']}" step="0.01" class="modern-input" style="background:var(--bg);margin:0;width:75px;padding:8px;" disabled></td>
-            <td><input type="number" name="qty_{r['id']}" value="{r['qty']}" class="modern-input" style="background:var(--bg);margin:0;width:75px;padding:8px;" disabled></td>
-            <td><input type="number" name="net_{r['id']}" value="{r['net']}" step="0.001" class="modern-input" style="background:var(--bg);margin:0;width:80px;padding:8px;" disabled></td>
-            <td><input type="number" name="gross_{r['id']}" value="{r['gross']}" step="0.001" class="modern-input" style="background:var(--bg);margin:0;width:80px;padding:8px;" disabled></td>
-            <td><input type="text" name="color_{r['id']}" value="{r['color'] or 'var(--surface)'}" class="modern-input" style="background:var(--bg);margin:0;width:100px;padding:8px;" disabled></td>
-            <td style="text-align:right"><button type="submit" name="delete_pid" value="{r['id']}" class="btn btn-danger" style="padding:6px 12px;">Delete</button></td>
+            <td><input type="number" name="price_{r['product_code']}" value="{r['price']}" step="0.01" class="modern-input" style="background:var(--bg);margin:0;width:75px;padding:8px;" disabled></td>
+            <td><input type="number" name="qty_{r['product_code']}" value="{r['qty']}" class="modern-input" style="background:var(--bg);margin:0;width:75px;padding:8px;" disabled></td>
+            <td><input type="number" name="net_{r['product_code']}" value="{r['net']}" step="0.001" class="modern-input" style="background:var(--bg);margin:0;width:80px;padding:8px;" disabled></td>
+            <td><input type="number" name="gross_{r['product_code']}" value="{r['gross']}" step="0.001" class="modern-input" style="background:var(--bg);margin:0;width:80px;padding:8px;" disabled></td>
+            <td><input type="text" name="color_{r['product_code']}" value="{r['color'] or 'var(--surface)'}" class="modern-input" style="background:var(--bg);margin:0;width:100px;padding:8px;" disabled></td>
+            <td style="text-align:right"><button type="submit" name="delete_pid" value="{r['product_code']}" class="btn btn-danger" style="padding:6px 12px;">Delete</button></td>
         </tr>
     ''' for r in rows)
 
@@ -2656,15 +2614,15 @@ def inventory():
         <form method="POST" style="margin:0">
             <table style="min-width: 1100px; font-size:0.95rem;">
                 <thead style="background:var(--surface)">
-                    <tr><th>Sort</th><th>Full Name</th><th>Display Pad</th><th>Gas Type</th><th>Price (£)</th><th>Qty</th><th>Net Wt</th><th>Gross Wt</th><th>Color</th><th style="text-align:right">Actions</th></tr>
+                    <tr><th>Sort</th><th>Code / SKU</th><th>Full Name</th><th>Display Pad</th><th>Gas Type</th><th>Price (£)</th><th>Qty</th><th>Net Wt</th><th>Gross Wt</th><th>Color</th><th style="text-align:right">Actions</th></tr>
                 </thead>
                 <tbody>{table_rows}</tbody>
             </table>
             <div style="padding:24px;background:var(--surface);border-top:1px solid var(--border)">
                 <h3 style="margin-bottom:16px;">Add New Product</h3>
                 <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
-                    <input type="number" name="new_sort" placeholder="Sort" class="modern-input" style="margin:0;width:60px;">
-                    <input type="text" name="new_name" placeholder="Full Name" class="modern-input" style="margin:0;flex:2;">
+                    <input type="text" name="new_code" placeholder="Code/SKU" class="modern-input" style="margin:0;width:100px;" required>
+                    <input type="text" name="new_name" placeholder="Full Name" class="modern-input" style="margin:0;flex:2;" required>
                     <input type="text" name="new_display" placeholder="Short Name" class="modern-input" style="margin:0;flex:1;">
                     <select name="new_gas" class="modern-input" style="margin:0;flex:1;padding:12px;">
                         <option value="">No Gas Type</option>
@@ -2673,9 +2631,7 @@ def inventory():
                     </select>
                     <input type="number" name="new_price" placeholder="£" step="0.01" class="modern-input" style="margin:0;width:70px;">
                     <input type="number" name="new_qty" placeholder="Qty" class="modern-input" style="margin:0;width:70px;">
-                    <input type="number" name="new_net" placeholder="Net Wt" step="0.001" class="modern-input" style="margin:0;width:80px;">
-                    <input type="number" name="new_gross" placeholder="Gross" step="0.001" class="modern-input" style="margin:0;width:80px;">
-                    <input type="text" name="new_color" placeholder="Color (CSS)" class="modern-input" style="margin:0;width:100px;">
+                    <input type="number" name="new_sort" placeholder="Sort" class="modern-input" style="margin:0;width:60px;">
                     <button type="submit" class="btn btn-primary" style="height:49px;">Add</button>
                 </div>
             </div>
@@ -2706,7 +2662,6 @@ def sync_sumup():
         conn = get_db()
         cur = conn.cursor()
         
-        # 1. Bulletproof Database Setup (Automatically fixes missing columns/profiles)
         cur.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS order_type VARCHAR(50) DEFAULT 'Delivery'")
         cur.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS external_id VARCHAR(255) UNIQUE")
         cur.execute("INSERT INTO customers (phone, name, address, town, postcode) VALUES ('00000000000', 'Walk-in Customer', 'In-Store', 'Swindon', 'SN3 4PN') ON CONFLICT (phone) DO NOTHING")
@@ -2729,11 +2684,9 @@ def sync_sumup():
                 amount = item.get("amount")
                 created_at = item.get("timestamp")
                 
-                # Raw revenue tracking
                 cur.execute("INSERT INTO sumup_payments (id, amount, status, description, created_at) VALUES (%s, %s, %s, %s, %s) ON CONFLICT (id) DO NOTHING", 
                             (t_id, amount, 'PAID', f"SumUp: {item.get('transaction_code')}", created_at))
                 
-                # Check if processed
                 cur.execute("SELECT id FROM orders WHERE external_id = %s", (t_id,))
                 if cur.fetchone(): 
                     debug_logs.append(f"[{t_id}] Skipped: Already synced to CRM.")
@@ -2747,9 +2700,7 @@ def sync_sumup():
                     continue
 
                 tx_res = res.json()
-                print(json.dumps(tx_res, indent=2))
 
-                # NOW check if processed
                 cur.execute("SELECT id FROM orders WHERE external_id = %s", (t_id,))
                 if cur.fetchone(): 
                     debug_logs.append(f"[{t_id}] Skipped: Already synced to CRM.")
@@ -2763,10 +2714,6 @@ def sync_sumup():
                     or []
                 )
                 items_to_insert = []
-
-                print(json.dumps(tx_res, indent=2))
-                print("HISTORY RESPONSE:")
-                print(json.dumps(r.json(), indent=2))
                 
                 if not products_sold:
                     order_date = item.get("timestamp", str(datetime.today().date()))[:10]
@@ -2785,7 +2732,7 @@ def sync_sumup():
                     matched_product = db_products.get(sp_name) or db_display_names.get(sp_name)
                     if matched_product:
                         items_to_insert.append({
-                            'pid': matched_product['id'],
+                            'pid': matched_product['product_code'],
                             'qty': sp.get('quantity', 1),
                             'price': sp.get('price', matched_product['price'])
                         })
@@ -2801,8 +2748,8 @@ def sync_sumup():
                     )
                     oid = cur.fetchone()[0]
                     for i in items_to_insert:
-                        cur.execute("INSERT INTO order_items (order_id, product_id, quantity, custom_price) VALUES (%s,%s,%s,%s)", (oid, i['pid'], i['qty'], i['price']))
-                        cur.execute("INSERT INTO inventory (product_id, quantity) VALUES (%s, %s) ON CONFLICT (product_id) DO UPDATE SET quantity = inventory.quantity + EXCLUDED.quantity", 
+                        cur.execute("INSERT INTO order_items (order_id, product_code, quantity, custom_price) VALUES (%s,%s,%s,%s)", (oid, i['pid'], i['qty'], i['price']))
+                        cur.execute("INSERT INTO inventory (product_code, quantity) VALUES (%s, %s) ON CONFLICT (product_code) DO UPDATE SET quantity = inventory.quantity + EXCLUDED.quantity", 
                                     (i['pid'], -i['qty']))
                     debug_logs.append(f"[{t_id}] 📦 Successfully created Order #{oid} and deducted inventory.")
                 else:
@@ -2811,7 +2758,6 @@ def sync_sumup():
         conn.commit()
         cur.close(); conn.close()
         
-        # Display the log so you can see exactly what happened
         log_html = "<br><br>".join(debug_logs)
         return f"""
         <body style="font-family: monospace; padding: 40px; background: #0e0f13; color: #e8eaf0; font-size:16px;">
@@ -2826,7 +2772,6 @@ def sync_sumup():
         """
         
     except Exception as e:
-        # If the database completely crashes, output the exact error code
         return f"<body style='padding:40px; background:#0e0f13; color:#ef4444; font-family:monospace;'><h1>CRITICAL DATABASE ERROR</h1><p>{str(e)}</p></body>", 500
 
 @app.route("/save_walkin", methods=["POST"])
@@ -2840,7 +2785,6 @@ def save_walkin():
     conn = get_db()
     cur = conn.cursor()
     
-    # Ensure Walk-in customer profile exists before saving
     cur.execute("INSERT INTO customers (phone, name, address, town, postcode) VALUES ('00000000000', 'Walk-in Customer', 'In-Store', 'Swindon', 'SN3 4PN') ON CONFLICT (phone) DO NOTHING")
     
     cur.execute(
@@ -2851,12 +2795,13 @@ def save_walkin():
 
     for pid, data in items.items():
         qty = int(data['qty'])
-        cur.execute("INSERT INTO order_items (order_id, product_id, quantity, custom_name, custom_price) VALUES (%s,%s,%s,%s,%s)",
-                    (oid, int(pid), qty, data.get('custom_name'), data.get('price')))
+        prod_code = pid if not str(pid).isdigit() else f"SKU-{pid}"
+        cur.execute("INSERT INTO order_items (order_id, product_code, quantity, custom_name, custom_price) VALUES (%s,%s,%s,%s,%s)",
+                    (oid, prod_code, qty, data.get('custom_name'), data.get('price')))
         cur.execute("""
-            INSERT INTO inventory (product_id, quantity) VALUES (%s, %s)
-            ON CONFLICT (product_id) DO UPDATE SET quantity = inventory.quantity + EXCLUDED.quantity
-        """, (int(pid), -qty))
+            INSERT INTO inventory (product_code, quantity) VALUES (%s, %s)
+            ON CONFLICT (product_code) DO UPDATE SET quantity = inventory.quantity + EXCLUDED.quantity
+        """, (prod_code, -qty))
 
     conn.commit(); cur.close(); conn.close()
     return redirect("/cash")
