@@ -286,21 +286,42 @@ def predict_next_calls(days=3):
 def get_inventory_status():
     conn = get_db()
     cur = conn.cursor()
+    
+    # Using a subquery prevents Cartesian explosions and speeds up the page load massively
     cur.execute("""
-        SELECT p.name, p.product_code, COALESCE(i.quantity,0) as stock, COALESCE(SUM(oi.quantity),0) as sold_last_week
+        SELECT p.name, p.product_code, 
+               COALESCE(i.quantity, 0) as stock, 
+               COALESCE(recent_sales.qty, 0) as sold_last_week
         FROM products p
-        LEFT JOIN inventory i ON p.product_code=i.product_code
-        LEFT JOIN order_items oi ON p.product_code=oi.product_code
-        LEFT JOIN orders o ON oi.order_id=o.id AND o.order_date >= CURRENT_DATE - INTERVAL '7 days'
-        GROUP BY p.name, p.product_code, i.quantity
+        LEFT JOIN inventory i ON p.product_code = i.product_code
+        LEFT JOIN (
+            SELECT oi.product_code, SUM(oi.quantity) as qty
+            FROM order_items oi
+            JOIN orders o ON oi.order_id = o.id
+            WHERE o.order_date >= CURRENT_DATE - INTERVAL '7 days'
+            GROUP BY oi.product_code
+        ) recent_sales ON p.product_code = recent_sales.product_code
+        WHERE p.is_active = TRUE
+        ORDER BY p.name ASC
     """)
     rows = cur.fetchall()
     cur.close(); conn.close()
     
     result = []
     for r in rows:
-        days_left = (r["stock"] / r["sold_last_week"]) * 7 if r["sold_last_week"] > 0 else None
-        result.append({"name": r["name"], "code": r["product_code"], "stock": r["stock"], "days_left": round(days_left,1) if days_left else None})
+        # Cast to floats safely to prevent division errors
+        stock = float(r["stock"])
+        sold = float(r["sold_last_week"])
+        
+        days_left = (stock / sold) * 7 if sold > 0 else None
+        
+        result.append({
+            "name": r["name"], 
+            "code": r["product_code"], 
+            "stock": int(stock), 
+            "days_left": round(days_left, 1) if days_left else None
+        })
+        
     return result
 
 # ── Shared HTML assets ────────────────────────────────────────────────────────
