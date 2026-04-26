@@ -240,6 +240,12 @@ def get_period_revenue(start, end):
 def predict_next_calls(days=3):
     conn = get_db()
     cur = conn.cursor()
+    
+    # NEW: Fetch ALL customers in a single query and map them into memory
+    cur.execute("SELECT phone, name FROM customers")
+    cust_map = {r['phone']: r['name'] for r in cur.fetchall()}
+    
+    # Fetch historical orders
     cur.execute("SELECT phone, order_date FROM orders GROUP BY phone, order_date ORDER BY phone, order_date")
     rows = cur.fetchall()
     cur.close(); conn.close()
@@ -270,8 +276,8 @@ def predict_next_calls(days=3):
         adjusted_avg = round(base_avg * adjustment_factor)
         next_date = dates[-1] + timedelta(days=max(1, adjusted_avg))
 
-        cust = get_customer(phone)
-        name = cust["name"] if cust else "Unknown"
+        # NEW: Look up the name from our in-memory dictionary instantly
+        name = cust_map.get(phone, "Unknown")
         call_data = {"name": name, "phone": phone, "expected": str(next_date)}
 
         if next_date < today:
