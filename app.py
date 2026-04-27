@@ -697,6 +697,9 @@ def lookup():
                 <strong style="font-size:1.1rem;">£{o["total"]:.2f}</strong>
             </div>
             <div style="margin-top:8px; display:flex; justify-content:flex-end; gap:8px;">
+                <button type="button" class="btn btn-ghost" style="padding:4px 8px;font-size:0.8rem; color:var(--text);" onclick="openPrintModal('{o["id"]}', 'Invoice')">📄 Inv</button>
+                <button type="button" class="btn btn-ghost" style="padding:4px 8px;font-size:0.8rem; color:var(--text);" onclick="openPrintModal('{o["id"]}', 'Receipt')">🧾 Rec</button>
+                
                 <button type="button" class="btn btn-ghost" style="padding:4px 8px;font-size:0.8rem; color:var(--accent);" onclick="editOrder('{o["id"]}')">✏️ Edit</button>
                 <form method="POST" action="/delete_order" style="margin:0;">
                     <input type="hidden" name="order_id" value="{o["id"]}">
@@ -827,6 +830,25 @@ def lookup():
         </div>
     </div>
 
+    <div id="print-modal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.6); z-index:1000; align-items:center; justify-content:center; backdrop-filter:blur(3px);">
+        <div class="card" style="width:100%; max-width:350px; box-shadow: 0 10px 25px rgba(0,0,0,0.5);">
+            <h3 style="margin-top:0;" id="print-title">Print Document</h3>
+            <input type="hidden" id="print-order-id">
+            <input type="hidden" id="print-type">
+            
+            <label style="display:block; font-size:0.9rem; margin-bottom:4px; color:var(--muted);">Document Date</label>
+            <input type="date" id="print-date" class="modern-input" value="{datetime.today().date()}">
+            
+            <label style="display:block; font-size:0.9rem; margin-top:12px; margin-bottom:4px; color:var(--muted);">Due Date</label>
+            <input type="date" id="print-due" class="modern-input" value="{datetime.today().date()}">
+            
+            <div style="display:flex; gap:12px; justify-content:flex-end; margin-top:20px;">
+                <button type="button" class="btn btn-ghost" onclick="document.getElementById('print-modal').style.display='none'">Cancel</button>
+                <button type="button" class="btn btn-primary" onclick="submitPrintModal()">Generate Document</button>
+            </div>
+        </div>
+    </div>
+
     <script>
     const currentPhone = "{phone}";
     let items = {{}};
@@ -837,6 +859,35 @@ def lookup():
     const productMap = {json.dumps(p_map)};
     const defaultPrices = {json.dumps(d_prices)};
     const recentOrders = {json.dumps({str(o['id']): o for o in orders[:5]}, default=str)};
+
+    function openPrintModal(orderId, type) {{
+        let o = recentOrders[orderId];
+        
+        // Grab the original order date to prefill the modal (fallback to today)
+        let oDate = o && o.date ? o.date.toString().substring(0, 10) : document.getElementById('print-date').defaultValue;
+
+        document.getElementById('print-order-id').value = orderId;
+        document.getElementById('print-type').value = type;
+        document.getElementById('print-title').innerText = "Print " + type;
+        
+        // Auto-fill the dates with the order date
+        document.getElementById('print-date').value = oDate;
+        document.getElementById('print-due').value = oDate;
+        
+        document.getElementById('print-modal').style.display = 'flex';
+    }}
+
+    function submitPrintModal() {{
+        let oid = document.getElementById('print-order-id').value;
+        let type = document.getElementById('print-type').value;
+        let date = document.getElementById('print-date').value;
+        let due = document.getElementById('print-due').value;
+        
+        document.getElementById('print-modal').style.display = 'none';
+        
+        // Open the printable document in a new tab so they don't lose their place
+        window.open(`/print_doc?order_id=${{oid}}&type=${{type}}&date=${{date}}&due=${{due}}`, '_blank');
+    }}
 
     function editOrder(orderId) {{
         let o = recentOrders[orderId];
@@ -1058,6 +1109,241 @@ def lookup():
     </script>
     '''
     return page("Lookup", body, wide=True)
+
+@app.route("/print_doc")
+@login_required
+def print_doc():
+    order_id = request.args.get("order_id")
+    doc_type = request.args.get("type", "Invoice")
+    inv_date = request.args.get("date", str(datetime.today().date()))
+    due_date = request.args.get("due", str(datetime.today().date()))
+    
+    try:
+        inv_date = datetime.strptime(inv_date, "%Y-%m-%d").strftime("%d %b %Y")
+        due_date = datetime.strptime(due_date, "%Y-%m-%d").strftime("%d %b %Y")
+    except:
+        pass
+
+    conn = get_db()
+    cur = conn.cursor()
+    
+    cur.execute("""
+        SELECT o.*, c.name, c.address, c.town, c.postcode
+        FROM orders o
+        JOIN customers c ON o.phone = c.phone
+        WHERE o.id = %s
+    """, (order_id,))
+    order = cur.fetchone()
+    
+    if not order:
+        cur.close(); conn.close()
+        return "Order not found", 404
+
+    cur.execute("""
+        SELECT oi.quantity, COALESCE(oi.custom_name, p.name) as product_name, COALESCE(oi.custom_price, p.price) as price
+        FROM order_items oi
+        JOIN products p ON oi.product_code = p.product_code
+        WHERE oi.order_id = %s
+    """, (order_id,))
+    items = cur.fetchall()
+    cur.close(); conn.close()
+
+    items_html = ""
+    subtotal = 0.0
+    grand_total = 0.0
+
+    for item in items:
+        qty = item['quantity']
+        inc_price = float(item['price'])
+        ex_price = inc_price / 1.05
+        line_total_ex = ex_price * qty
+        
+        subtotal += line_total_ex
+        grand_total += (inc_price * qty)
+        
+        items_html += f'''
+        <tr>
+            <td style="padding: 4px 8px; border-bottom: 1px solid #eee;">{item['product_name']}</td>
+            <td style="padding: 4px 8px; border-bottom: 1px solid #eee;">{qty}</td>
+            <td style="padding: 4px 8px; border-bottom: 1px solid #eee;">£{ex_price:.2f}</td>
+            <td style="padding: 4px 8px; border-bottom: 1px solid #eee;">5% VAT</td>
+            <td style="padding: 4px 8px; border-bottom: 1px solid #eee;">£{line_total_ex:.2f}</td>
+        </tr>
+        '''
+        
+    vat_amount = grand_total - subtotal
+    
+    # Calculate derived invoice number safely (starts mapping at 41250)
+    invoice_num = 41250 + int(order_id)
+
+    # Conditionally render sections based on whether it is an Invoice or Receipt
+    meta_table = f"<tr><th>{doc_type} date</th><td>{inv_date}</td></tr>"
+    if doc_type == "Invoice":
+        meta_table = f"<tr><th>Invoice number</th><td>INV-{invoice_num}</td></tr>" + meta_table
+        meta_table += f"<tr><th>Due date</th><td>{due_date}</td></tr>"
+        
+    payment_html = ""
+    if doc_type == "Invoice":
+        payment_html = f'''
+        <div class="payment-box">
+            <div style="font-weight: bold; font-size: 0.95rem; margin-bottom: 4px;">Payment details</div>
+            <table class="payment-table">
+                <tr><td>Bank name:</td><td>Monzo</td></tr>
+                <tr><td>Account holder:</td><td>SLEEMANS TRADING LTD</td></tr>
+                <tr><td>Account number:</td><td>28931980</td></tr>
+                <tr><td>Sort code:</td><td>04-00-03</td></tr>
+                <tr><td>Payment reference:</td><td>INV-{invoice_num}</td></tr>
+            </table>
+        </div>
+        '''
+
+    due_html = f'<div class="footer-note">£{grand_total:.2f} due by {due_date}</div>' if doc_type == "Invoice" else ''
+
+    # Clean up database default names like "Unknown", "Unnamed Customer", etc.
+    cust_name = order['name']
+    if cust_name and cust_name.lower() in ["unnamed customer", "unknown", "walk-in customer"]:
+        cust_name = ""
+
+    # Helper formatters for address to prevent empty commas/spaces
+    addr = order['address'] or ""
+    twn = order['town'] or ""
+    pc = order['postcode'] or ""
+    twn_pc = f"{twn}, {pc}".strip(", ")
+
+    html = f'''
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <title>{doc_type} #{order_id}</title>
+        <style>
+            @import url('https://fonts.googleapis.com/css2?family=Helvetica:wght@400;700&display=swap');
+            
+            body {{ font-family: 'Helvetica', Arial, sans-serif; color: #333; line-height: 1.25; max-width: 800px; margin: 0 auto; padding: 20px; }}
+            
+            @page {{ margin: 0; size: auto; }}
+            @media print {{
+                body {{ padding: 15mm; }}
+                .no-print {{ display: none; }}
+            }}
+            
+            .logos-container {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; }}
+            .logos-container img {{ max-height: 60px; }}
+
+            .header-table {{ width: 100%; margin-bottom: 15px; border-collapse: collapse; }}
+            .header-table td {{ vertical-align: top; }}
+            h1 {{ font-size: 2rem; margin: 0; color: #555; text-transform: uppercase; font-weight: normal; }}
+            
+            .meta-table {{ border-collapse: collapse; width: auto; float: right; font-size: 0.85rem; }}
+            .meta-table th {{ text-align: left; padding: 2px 16px 2px 0; font-weight: bold; color: #555; }}
+            .meta-table td {{ text-align: right; padding: 2px 0; }}
+            
+            .company-name {{ font-size: 1.2rem; font-weight: bold; margin-bottom: 8px; }}
+            
+            .address-table {{ width: 100%; margin-bottom: 15px; border-collapse: collapse; font-size: 0.85rem; }}
+            .address-table td {{ vertical-align: top; width: 50%; }}
+            
+            .items-table {{ width: 100%; border-collapse: collapse; margin-bottom: 10px; font-size: 0.85rem; }}
+            .items-table th {{ text-align: left; border-bottom: 2px solid #333; padding: 6px 8px; font-weight: bold; }}
+            
+            .totals-table {{ border-collapse: collapse; float: right; width: 280px; margin-bottom: 15px; font-size: 0.85rem; }}
+            .totals-table td {{ padding: 4px 8px; text-align: right; border-bottom: 1px solid #eee; }}
+            .totals-table .bold-row td {{ font-weight: bold; border-bottom: none; border-top: 2px solid #333; font-size: 0.95rem; }}
+            
+            .payment-box {{ clear: both; margin-top: 15px; }}
+            .payment-table {{ border-collapse: collapse; font-size: 0.8rem; }}
+            .payment-table td {{ padding: 2px 16px 2px 0; }}
+            .payment-table td:first-child {{ color: #777; }}
+            
+            .footer-note {{ text-align: right; margin-top: 15px; font-weight: bold; font-size: 0.95rem; }}
+            
+            .page-footer {{ clear: both; text-align: right; color: #777; font-size: 0.8rem; margin-top: 40px; padding-top: 10px; }}
+        </style>
+    </head>
+    <body onload="window.print()">
+        
+        <div class="logos-container">
+            <img src="/static/logo.jpeg" alt="Sleemans Logo" onerror="this.style.display='none'">
+            <img src="/static/flogas_logo.png" alt="Flogas Logo" onerror="this.style.display='none'">
+        </div>
+        
+        <table class="header-table">
+            <tr>
+                <td><h1>{doc_type}</h1></td>
+                <td>
+                    <table class="meta-table">
+                        {meta_table}
+                    </table>
+                </td>
+            </tr>
+        </table>
+        
+        <div class="company-name">Sleemans</div>
+        
+        <table class="address-table">
+            <tr>
+                <td>
+                    <div style="color: #777; font-weight: bold; margin-bottom: 2px;">Billed to</div>
+                    <div style="font-weight: bold;">{cust_name}</div>
+                    <div>{addr}</div>
+                    <div>{twn_pc}</div>
+                    <div style="margin-top: 2px;">{'0' + str(order['phone']) if order['phone'] and str(order['phone']) != '00000000000' and str(order['phone']) != '11111111111' else ''}</div>
+                </td>
+                <td style="text-align: right;">
+                    <div style="font-weight: bold;">SLEEMANS TRADING LTD</div>
+                    <div>154 Swindon Road</div>
+                    <div>Stratton St. Margaret</div>
+                    <div>Swindon SN3 4PN</div>
+                    <div>United Kingdom</div>
+                    <div style="margin-top: 5px;">Info@sleemans.co.uk</div>
+                    <div>Company no: 16405862</div>
+                    <div>GB VAT: 493955435</div>
+                </td>
+            </tr>
+        </table>
+        
+        <table class="items-table">
+            <thead>
+                <tr>
+                    <th>Description</th>
+                    <th>Qty</th>
+                    <th>Unit price (GBP)</th>
+                    <th>Tax</th>
+                    <th>Total (GBP)</th>
+                </tr>
+            </thead>
+            <tbody>
+                {items_html}
+            </tbody>
+        </table>
+        
+        <table class="totals-table">
+            <tr>
+                <td style="text-align:left;">Subtotal</td>
+                <td>£{subtotal:.2f}</td>
+            </tr>
+            <tr>
+                <td style="text-align:left;">5% VAT</td>
+                <td>£{vat_amount:.2f}</td>
+            </tr>
+            <tr class="bold-row">
+                <td style="text-align:left;">Total</td>
+                <td>£{grand_total:.2f}</td>
+            </tr>
+        </table>
+        
+        {payment_html}
+        
+        {due_html}
+        
+        <div class="page-footer">
+            Page 1/1
+        </div>
+        
+    </body>
+    </html>
+    '''
+    return html
 
 @app.route("/api/set_special_price", methods=["POST"])
 @login_required
