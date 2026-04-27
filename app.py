@@ -240,6 +240,12 @@ def get_period_revenue(start, end):
 def predict_next_calls(days=3):
     conn = get_db()
     cur = conn.cursor()
+    
+    # NEW: Fetch ALL customers in a single query and map them into memory
+    cur.execute("SELECT phone, name FROM customers")
+    cust_map = {r['phone']: r['name'] for r in cur.fetchall()}
+    
+    # Fetch historical orders
     cur.execute("SELECT phone, order_date FROM orders GROUP BY phone, order_date ORDER BY phone, order_date")
     rows = cur.fetchall()
     cur.close(); conn.close()
@@ -270,8 +276,8 @@ def predict_next_calls(days=3):
         adjusted_avg = round(base_avg * adjustment_factor)
         next_date = dates[-1] + timedelta(days=max(1, adjusted_avg))
 
-        cust = get_customer(phone)
-        name = cust["name"] if cust else "Unknown"
+        # NEW: Look up the name from our in-memory dictionary instantly
+        name = cust_map.get(phone, "Unknown")
         call_data = {"name": name, "phone": phone, "expected": str(next_date)}
 
         if next_date < today:
@@ -286,21 +292,42 @@ def predict_next_calls(days=3):
 def get_inventory_status():
     conn = get_db()
     cur = conn.cursor()
+    
+    # Using a subquery prevents Cartesian explosions and speeds up the page load massively
     cur.execute("""
-        SELECT p.name, p.product_code, COALESCE(i.quantity,0) as stock, COALESCE(SUM(oi.quantity),0) as sold_last_week
+        SELECT p.name, p.product_code, 
+               COALESCE(i.quantity, 0) as stock, 
+               COALESCE(recent_sales.qty, 0) as sold_last_week
         FROM products p
-        LEFT JOIN inventory i ON p.product_code=i.product_code
-        LEFT JOIN order_items oi ON p.product_code=oi.product_code
-        LEFT JOIN orders o ON oi.order_id=o.id AND o.order_date >= CURRENT_DATE - INTERVAL '7 days'
-        GROUP BY p.name, p.product_code, i.quantity
+        LEFT JOIN inventory i ON p.product_code = i.product_code
+        LEFT JOIN (
+            SELECT oi.product_code, SUM(oi.quantity) as qty
+            FROM order_items oi
+            JOIN orders o ON oi.order_id = o.id
+            WHERE o.order_date >= CURRENT_DATE - INTERVAL '7 days'
+            GROUP BY oi.product_code
+        ) recent_sales ON p.product_code = recent_sales.product_code
+        WHERE p.is_active = TRUE
+        ORDER BY p.name ASC
     """)
     rows = cur.fetchall()
     cur.close(); conn.close()
     
     result = []
     for r in rows:
-        days_left = (r["stock"] / r["sold_last_week"]) * 7 if r["sold_last_week"] > 0 else None
-        result.append({"name": r["name"], "code": r["product_code"], "stock": r["stock"], "days_left": round(days_left,1) if days_left else None})
+        # Cast to floats safely to prevent division errors
+        stock = float(r["stock"])
+        sold = float(r["sold_last_week"])
+        
+        days_left = (stock / sold) * 7 if sold > 0 else None
+        
+        result.append({
+            "name": r["name"], 
+            "code": r["product_code"], 
+            "stock": int(stock), 
+            "days_left": round(days_left, 1) if days_left else None
+        })
+        
     return result
 
 # ── Shared HTML assets ────────────────────────────────────────────────────────
