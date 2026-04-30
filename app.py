@@ -77,9 +77,12 @@ def get_orders(phone, limit=None):
     if not phone_clean: return []
     conn = get_db()
     cur = conn.cursor()
+    # Updated SQL query to select tax_rate
     q = '''
         SELECT o.id, o.order_date, o.delivery_date, o.notes, o.is_paid, o.is_dispatched, o.is_delivered,
-               p.name, oi.quantity, COALESCE(oi.custom_name, p.display_name, p.name) as product, COALESCE(oi.custom_price, p.price) as price, oi.custom_name, p.product_code
+               p.name, oi.quantity, COALESCE(oi.custom_name, p.display_name, p.name) as product, 
+               COALESCE(oi.custom_price, p.price) as price, oi.custom_name, p.product_code, 
+               COALESCE(oi.tax_rate, p.tax_rate, 5) as tax_rate
         FROM orders o
         JOIN order_items oi ON o.id = oi.order_id
         JOIN products p ON oi.product_code = p.product_code
@@ -98,7 +101,14 @@ def get_orders(phone, limit=None):
             orders[oid] = {"id": oid, "date": r["order_date"], "delivery_date": r["delivery_date"], "notes": r["notes"], "is_paid": r["is_paid"], "is_dispatched": r["is_dispatched"], "is_delivered": r["is_delivered"], "items": [], "total": 0}
         
         display_name = r["custom_name"] if r["custom_name"] else r["name"]
-        orders[oid]["items"].append({"product": display_name, "qty": r["quantity"], "product_code": r["product_code"], "price": r["price"], "custom_name": r["custom_name"]})
+        orders[oid]["items"].append({
+            "product": display_name, 
+            "qty": r["quantity"], 
+            "product_code": r["product_code"], 
+            "price": float(r["price"]) if r["price"] else 0.0,  # Converted to float
+            "custom_name": r["custom_name"],
+            "tax_rate": float(r["tax_rate"]) if r["tax_rate"] else 5.0 # Added tax_rate as float
+        })
         orders[oid]["total"] += (float(r["price"]) or 0) * r["quantity"]
 
     return list(orders.values())
@@ -748,17 +758,23 @@ def lookup():
         
         is_special = pid_str in special_prices
         display_price = special_prices[pid_str] if is_special else p["price"]
-        price_style = "color:#eab308; font-weight:bold;" if is_special else ""
         
         tiles += f'''
         <div class="product-tile" id="tile-{p["product_code"]}" style="background-color: {bg_color}; padding: 12px 8px; position:relative;" onclick="addQty('{p["product_code"]}', '{safe_name}', {p["price"]})">
-            <div class="p-name" style="font-size:1rem;">{short_name}</div>
-            <div style="font-size:0.9rem;color:var(--muted);margin-top:4px; display:flex; justify-content:center; align-items:center; gap:6px;">
-                £<span id="price-display-{p['product_code']}" style="{price_style}">{display_price}</span>
-                <span onclick="event.stopPropagation(); setCustomPrice('{p['product_code']}', {display_price})" style="cursor:pointer; font-size:0.85rem;" title="Edit Special Price">✏️</span>
+            <div class="p-name" style="font-size:1.3rem; font-weight:700;">{short_name}</div>
+            <div style="font-size:1.1rem;color:var(--muted);margin-top:4px; display:flex; justify-content:center; align-items:center; gap:6px;">
+                £<span id="price-display-{p['product_code']}">{display_price}</span>
+                <span onclick="event.stopPropagation(); setCustomPrice('{p['product_code']}', {display_price})" style="cursor:pointer; font-size:0.95rem;" title="Edit Price">✏️</span>
             </div>
-            <div class="p-qty" id="qty-{p["product_code"]}" style="font-size:1.6rem; min-height:1.8rem; margin-top:6px;"></div>
-            <span style="position:absolute;top:6px;right:6px;font-size:1.2rem;color:var(--danger);display:none;cursor:pointer;background:var(--bg);border-radius:50%;width:24px;height:24px;line-height:24px;" id="reset-{p["product_code"]}" onclick="event.stopPropagation();resetTile('{p["product_code"]}')">&#x2715;</span>
+            
+            <!-- Hidden by default, shows up when qty > 0 -->
+            <div id="qty-container-{p["product_code"]}" style="display:none; align-items:center; justify-content:center; gap:8px; margin-top:12px;">
+                <button type="button" style="padding:6px 12px; font-size:1.2rem; border-radius:6px; background:var(--bg); border:1px solid var(--border); color:var(--text); cursor:pointer;" onclick="event.stopPropagation(); reduceQty('{p['product_code']}')">-</button>
+                <div class="p-qty" id="qty-{p["product_code"]}" style="font-size:1.8rem; margin:0; min-width:30px;"></div>
+                <button type="button" style="padding:6px 12px; font-size:1.2rem; border-radius:6px; background:var(--bg); border:1px solid var(--border); color:var(--text); cursor:pointer;" onclick="event.stopPropagation(); addQty('{p['product_code']}', '{safe_name}', {p['price']})">+</button>
+            </div>
+            
+            <span style="position:absolute;top:6px;right:6px;font-size:1.2rem;color:var(--danger);display:none;cursor:pointer;background:var(--bg);border-radius:50%;width:24px;height:24px;line-height:24px;" id="reset-{p["product_code"]}" onclick="event.stopPropagation();resetTile('{p['product_code']}')">&#x2715;</span>
         </div>
         '''
 
@@ -847,8 +863,16 @@ def lookup():
             <label style="display:block; font-size:0.9rem; margin-bottom:4px; color:var(--muted);">Item Name</label>
             <input type="text" id="other-name" class="modern-input" placeholder="e.g. Extra Regulator">
             
-            <label style="display:block; font-size:0.9rem; margin-top:12px; margin-bottom:4px; color:var(--muted);">Price (£)</label>
-            <input type="number" id="other-price" class="modern-input" placeholder="0.00" step="0.01">
+            <div style="display:flex; gap:12px; margin-top:12px;">
+                <div style="flex:1;">
+                    <label style="display:block; font-size:0.9rem; margin-bottom:4px; color:var(--muted);">Price (£)</label>
+                    <input type="number" id="other-price" class="modern-input" placeholder="0.00" step="0.01">
+                </div>
+                <div style="flex:1;">
+                    <label style="display:block; font-size:0.9rem; margin-bottom:4px; color:var(--muted);">Tax (%)</label>
+                    <input type="number" id="other-tax" class="modern-input" value="5" step="0.1">
+                </div>
+            </div>
             
             <div style="display:flex; gap:12px; justify-content:flex-end; margin-top:20px;">
                 <button type="button" class="btn btn-ghost" onclick="document.getElementById('other-modal').style.display='none'">Cancel</button>
@@ -904,6 +928,106 @@ def lookup():
         document.getElementById('print-modal').style.display = 'flex';
     }}
 
+    function reduceQty(id) {{
+        if(!items[id]) return;
+        items[id].qty -= 1;
+        total -= items[id].price;
+        
+        if(items[id].qty <= 0) {{
+            resetTile(id);
+        }} else {{
+            document.getElementById("qty-"+id).textContent = items[id].qty;
+            document.getElementById("live-total").innerText = Math.max(0, total).toFixed(2);
+        }}
+    }}
+
+    function submitOtherModal() {{
+        let n = document.getElementById('other-name').value.trim();
+        let p = parseFloat(document.getElementById('other-price').value);
+        let t = parseFloat(document.getElementById('other-tax').value) || 5; 
+        
+        // We hardcode quantity to 1 and remove the broken getElementById!
+        let q = 1; 
+        
+        if(!n || isNaN(p)) {{
+            alert("Please enter a valid name and price.");
+            return;
+        }}
+        
+        let id = 'other_' + Date.now();
+        // Add tax to the dictionary so Python receives it
+        items[id] = {{qty: q, price: p, custom_name: n, tax: t}}; 
+        total += p;
+        
+        let grid = document.querySelector('.product-grid');
+        let div = document.createElement('div');
+        div.className = 'product-tile selected';
+        div.id = 'tile-' + id;
+        div.style.backgroundColor = 'var(--surface)';
+        div.style.padding = '12px 8px';
+        div.style.position = 'relative';
+        
+        div.innerHTML = `
+            <div class="p-name" style="font-size:1.3rem; font-weight:700;">${{n}}</div>
+            <div style="font-size:1.1rem;color:var(--muted);margin-top:4px;">£${{p.toFixed(2)}} <span style="font-size:0.8rem">(${{t}}% tax)</span></div>
+            <div id="qty-container-${{id}}" style="display:flex; align-items:center; justify-content:center; gap:8px; margin-top:12px;">
+                <button type="button" style="padding:6px 12px; font-size:1.2rem; border-radius:6px; background:var(--bg); border:1px solid var(--border); color:var(--text); cursor:pointer;" onclick="event.stopPropagation(); reduceQty('${{id}}')">-</button>
+                <div class="p-qty" id="qty-${{id}}" style="font-size:1.8rem; margin:0; min-width:30px;">${{q}}</div>
+                <button type="button" style="padding:6px 12px; font-size:1.2rem; border-radius:6px; background:var(--bg); border:1px solid var(--border); color:var(--text); cursor:pointer;" onclick="event.stopPropagation(); executeAdd('${{id}}', 'Other_Existing', ${{p}})">+</button>
+            </div>
+            <span style="position:absolute;top:6px;right:6px;font-size:1.2rem;color:var(--danger);cursor:pointer;background:var(--bg);border-radius:50%;width:24px;height:24px;line-height:24px;" onclick="event.stopPropagation();resetTile('${{id}}')">&#x2715;</span>
+        `;
+        grid.appendChild(div);
+        
+        document.getElementById('live-total').innerText = total.toFixed(2);
+        document.getElementById('other-modal').style.display = 'none';
+    }}
+
+    function executeAdd(id, name, price) {{
+        // Stop it from re-prompting if we click + on an existing custom tile
+        let cPrice = customPrices[id] !== undefined ? customPrices[id] : price;
+        if(items[id] && items[id].price !== undefined && name === 'Other_Existing') cPrice = items[id].price;
+        
+        let cName = items[id] ? items[id].custom_name : null;
+        
+        if(!items[id]) items[id] = {{qty:0, price: cPrice, custom_name: cName}};
+        items[id].qty += 1;
+        total += cPrice;
+        
+        document.getElementById("qty-"+id).textContent = items[id].qty;
+        
+        // Show the +/- container instead of just text
+        let container = document.getElementById("qty-container-"+id);
+        if(container) container.style.display = "flex";
+        
+        let tile = document.getElementById("tile-"+id);
+        if(tile) tile.classList.add("selected");
+        
+        let resetBtn = document.getElementById("reset-"+id);
+        if(resetBtn) resetBtn.style.display = "block";
+        
+        document.getElementById("live-total").innerText = total.toFixed(2);
+    }}
+
+    function resetTile(id) {{
+        if(items[id]) total -= (items[id].price * items[id].qty);
+        delete items[id];
+        
+        // If it's a dynamic 'Other' tile, destroy it completely
+        if(id.toString().startsWith('other_')) {{
+            let el = document.getElementById('tile-'+id);
+            if(el) el.remove();
+        }} else {{
+            // Otherwise just hide the UI for standard catalog items
+            document.getElementById("qty-"+id).textContent="";
+            let container = document.getElementById("qty-container-"+id);
+            if(container) container.style.display = "none";
+            document.getElementById("tile-"+id).classList.remove("selected");
+            document.getElementById("reset-"+id).style.display = "none";
+        }}
+        document.getElementById("live-total").innerText = Math.max(0, total).toFixed(2);
+    }}
+
     function submitPrintModal() {{
         let oid = document.getElementById('print-order-id').value;
         let type = document.getElementById('print-type').value;
@@ -914,6 +1038,46 @@ def lookup():
         
         // Open the printable document in a new tab so they don't lose their place
         window.open(`/print_doc?order_id=${{oid}}&type=${{type}}&date=${{date}}&due=${{due}}`, '_blank');
+    }}
+
+    function cancelEdit() {{
+        for (let id in items) {{
+            // If it's a dynamic 'Other' tile, destroy it completely
+            if(id.toString().startsWith('other_')) {{
+                let tile = document.getElementById("tile-"+id);
+                if(tile) tile.remove();
+            }} else {{
+                // Otherwise just reset standard catalog items
+                let qtyEl = document.getElementById("qty-"+id);
+                if(qtyEl) qtyEl.textContent = "";
+                let tileEl = document.getElementById("tile-"+id);
+                if(tileEl) tileEl.classList.remove("selected");
+                let resetEl = document.getElementById("reset-"+id);
+                if(resetEl) resetEl.style.display = "none";
+                let container = document.getElementById("qty-container-"+id);
+                if(container) container.style.display = "none";
+            }}
+        }}
+        
+        items = {{}};
+        total = 0.0;
+        document.getElementById("live-total").innerText = "0.00";
+
+        document.querySelector('input[name="order_date"]').value = "{datetime.today().date()}";
+        document.querySelector('input[name="delivery_date"]').value = "{datetime.today().date()}";
+        document.querySelector('input[name="notes"]').value = "";
+        document.querySelector('input[name="is_paid"]').checked = false;
+        document.getElementById('edit-order-id').value = "";
+
+        document.getElementById('form-title').innerText = "Select Products";
+        document.getElementById('order-form').action = "/save_order";
+        
+        let saveBtn = document.getElementById('save-btn');
+        saveBtn.innerText = "Save & Confirm Order";
+        // Clear the inline styles so it falls back to your native CSS btn-primary class!
+        saveBtn.style.background = ""; 
+        saveBtn.style.color = "";
+        document.getElementById('cancel-edit-btn').style.display = 'none';
     }}
 
     function editOrder(orderId) {{
@@ -931,18 +1095,43 @@ def lookup():
                 if (!id) return; 
 
                 let pName = i.custom_name || i.product;
-                let pPrice = i.price;
-                if (pPrice === undefined || pPrice === null) {{
-                    pPrice = customPrices[id] !== undefined ? customPrices[id] : defaultPrices[id];
-                }}
-                if (isNaN(pPrice)) pPrice = 0;
+                // Safely parse as floats just to be absolutely sure
+                let pPrice = parseFloat(i.price) || 0;
+                let pTax = parseFloat(i.tax_rate) || 5;
 
-                items[id] = {{qty: i.qty, price: pPrice, custom_name: pName}};
+                // Force to string so it matches whether the DB sends a number or string!
+                if (id.toString() === '40004') {{
+                    id = 'other_' + Date.now() + Math.floor(Math.random() * 1000);
+                    let grid = document.querySelector('.product-grid');
+                    let div = document.createElement('div');
+                    div.className = 'product-tile selected';
+                    div.id = 'tile-' + id;
+                    div.style.backgroundColor = 'var(--surface)';
+                    div.style.padding = '12px 8px';
+                    div.style.position = 'relative';
+                    div.innerHTML = `
+                        <div class="p-name" style="font-size:1.3rem; font-weight:700;">${{pName}}</div>
+                        <div style="font-size:1.1rem;color:var(--muted);margin-top:4px;">£${{pPrice.toFixed(2)}} <span style="font-size:0.8rem">(${{pTax}}% tax)</span></div>
+                        <div id="qty-container-${{id}}" style="display:flex; align-items:center; justify-content:center; gap:8px; margin-top:12px;">
+                            <button type="button" style="padding:6px 12px; font-size:1.2rem; border-radius:6px; background:var(--bg); border:1px solid var(--border); color:var(--text); cursor:pointer;" onclick="event.stopPropagation(); reduceQty('${{id}}')">-</button>
+                            <div class="p-qty" id="qty-${{id}}" style="font-size:1.8rem; margin:0; min-width:30px;">${{i.qty}}</div>
+                            <button type="button" style="padding:6px 12px; font-size:1.2rem; border-radius:6px; background:var(--bg); border:1px solid var(--border); color:var(--text); cursor:pointer;" onclick="event.stopPropagation(); executeAdd('${{id}}', 'Other_Existing', ${{pPrice}})">+</button>
+                        </div>
+                        <span style="position:absolute;top:6px;right:6px;font-size:1.2rem;color:var(--danger);cursor:pointer;background:var(--bg);border-radius:50%;width:24px;height:24px;line-height:24px;" onclick="event.stopPropagation();resetTile('${{id}}')">&#x2715;</span>
+                    `;
+                    grid.appendChild(div);
+                }}
+
+                // Save the tax to the global items dictionary so it goes back to the DB on save!
+                items[id] = {{qty: i.qty, price: pPrice, custom_name: pName, tax: pTax}};
                 total += (pPrice * i.qty);
 
                 let qtyEl = document.getElementById("qty-"+id);
-                if(qtyEl) {{
+                // Only trigger the UI updates below if it's a standard inventory item
+                if(qtyEl && !id.toString().startsWith('other_')) {{
                     qtyEl.textContent = items[id].qty;
+                    let container = document.getElementById("qty-container-"+id);
+                    if(container) container.style.display = "flex";
                     document.getElementById("tile-"+id).classList.add("selected");
                     document.getElementById("reset-"+id).style.display = "block";
                 }}
@@ -961,39 +1150,9 @@ def lookup():
         let saveBtn = document.getElementById('save-btn');
         saveBtn.innerText = "Update Order";
         saveBtn.style.background = "#eab308"; 
-        saveBtn.style.color = "black";
+        saveBtn.style.color = "#000"; 
         document.getElementById('cancel-edit-btn').style.display = 'inline-block';
         document.getElementById('form-title').scrollIntoView({{behavior: "smooth"}});
-    }}
-
-    function cancelEdit() {{
-        for (let id in items) {{
-            let qtyEl = document.getElementById("qty-"+id);
-            if(qtyEl) qtyEl.textContent = "";
-            let tileEl = document.getElementById("tile-"+id);
-            if(tileEl) tileEl.classList.remove("selected");
-            let resetEl = document.getElementById("reset-"+id);
-            if(resetEl) resetEl.style.display = "none";
-        }}
-        
-        items = {{}};
-        total = 0.0;
-        document.getElementById("live-total").innerText = "0.00";
-
-        document.querySelector('input[name="order_date"]').value = "{datetime.today().date()}";
-        document.querySelector('input[name="delivery_date"]').value = "{datetime.today().date()}";
-        document.querySelector('input[name="notes"]').value = "";
-        document.querySelector('input[name="is_paid"]').checked = false;
-        document.getElementById('edit-order-id').value = "";
-
-        document.getElementById('form-title').innerText = "Select Products";
-        document.getElementById('order-form').action = "/save_order";
-        
-        let saveBtn = document.getElementById('save-btn');
-        saveBtn.innerText = "Save & Confirm Order";
-        saveBtn.style.background = "var(--primary)"; 
-        saveBtn.style.color = "white";
-        document.getElementById('cancel-edit-btn').style.display = 'none';
     }}
 
     async function setCustomPrice(id, defaultPrice) {{
@@ -1041,52 +1200,6 @@ def lookup():
             return;
         }}
         executeAdd(id, name, price);
-    }}
-
-    function submitOtherModal() {{
-        let n = document.getElementById('other-name').value.trim();
-        let p = parseFloat(document.getElementById('other-price').value);
-        if(!n || isNaN(p)) {{
-            alert("Please enter a valid name and price.");
-            return;
-        }}
-        
-        let id = pendingOtherId;
-        items[id] = {{qty:0, price: p, custom_name: n}};
-        executeAdd(id, 'Other', p);
-        document.getElementById('other-modal').style.display = 'none';
-    }}
-
-    function executeAdd(id, name, price) {{
-        let cPrice;
-        if (name === 'Other') {{
-            cPrice = items[id] ? items[id].price : price;
-        }} else {{
-            cPrice = customPrices[id] !== undefined ? customPrices[id] : price;
-        }}
-        
-        let cName = items[id] ? items[id].custom_name : null;
-        
-        if(!items[id]) items[id] = {{qty:0, price: cPrice, custom_name: cName}};
-        items[id].qty += 1;
-        total += cPrice;
-        
-        document.getElementById("qty-"+id).textContent = items[id].qty;
-        document.getElementById("tile-"+id).classList.add("selected");
-        document.getElementById("reset-"+id).style.display = "block";
-        document.getElementById("live-total").innerText = total.toFixed(2);
-    }}
-
-    function resetTile(id) {{
-        if(items[id]) total -= (items[id].price * items[id].qty);
-        delete items[id];
-        let qtyEl = document.getElementById("qty-"+id);
-        if(qtyEl) qtyEl.textContent="";
-        let tileEl = document.getElementById("tile-"+id);
-        if(tileEl) tileEl.classList.remove("selected");
-        let resetEl = document.getElementById("reset-"+id);
-        if(resetEl) resetEl.style.display = "none";
-        document.getElementById("live-total").innerText = Math.max(0, total).toFixed(2);
     }}
 
     function prepareSubmit() {{
@@ -1166,8 +1279,11 @@ def print_doc():
         cur.close(); conn.close()
         return "Order not found", 404
 
+    # Pulls custom tax from the order item, falls back to the product tax, and defaults to 5 if both are missing
     cur.execute("""
-        SELECT oi.quantity, COALESCE(oi.custom_name, p.name) as product_name, COALESCE(oi.custom_price, p.price) as price
+        SELECT oi.quantity, COALESCE(oi.custom_name, p.name) as product_name, 
+               COALESCE(oi.custom_price, p.price) as price, 
+               COALESCE(oi.tax_rate, p.tax_rate, 5) as tax_rate
         FROM order_items oi
         JOIN products p ON oi.product_code = p.product_code
         WHERE oi.order_id = %s
@@ -1178,27 +1294,42 @@ def print_doc():
     items_html = ""
     subtotal = 0.0
     grand_total = 0.0
+    vat_summary = {}
 
     for item in items:
         qty = item['quantity']
         inc_price = float(item['price'])
-        ex_price = inc_price / 1.05
+        tax_rate = float(item['tax_rate'])
+        
+        # Dynamically strip the VAT based on the specific item's rate
+        ex_price = inc_price / (1 + (tax_rate / 100))
         line_total_ex = ex_price * qty
+        line_vat = (inc_price - ex_price) * qty
         
         subtotal += line_total_ex
         grand_total += (inc_price * qty)
+        
+        # Group VAT by percentage so the footer looks clean
+        vat_summary[tax_rate] = vat_summary.get(tax_rate, 0) + line_vat
         
         items_html += f'''
         <tr>
             <td style="padding: 4px 8px; border-bottom: 1px solid #eee;">{item['product_name']}</td>
             <td style="padding: 4px 8px; border-bottom: 1px solid #eee;">{qty}</td>
             <td style="padding: 4px 8px; border-bottom: 1px solid #eee;">£{ex_price:.2f}</td>
-            <td style="padding: 4px 8px; border-bottom: 1px solid #eee;">5% VAT</td>
-            <td style="padding: 4px 8px; border-bottom: 1px solid #eee;">£{line_total_ex:.2f}</td>
+            <td style="padding: 4px 8px; border-bottom: 1px solid #eee;">{tax_rate:g}% VAT</td>
+            <td style="padding: 4px 8px; border-bottom: 1px solid #eee;">£{(inc_price * qty):.2f}</td>
         </tr>
         '''
         
-    vat_amount = grand_total - subtotal
+    # Build the dynamic Totals table rows
+    totals_rows = f'<tr><td style="text-align:left;">Subtotal</td><td>£{subtotal:.2f}</td></tr>'
+    
+    for rate, amount in vat_summary.items():
+        if amount > 0:
+            totals_rows += f'<tr><td style="text-align:left;">{rate:g}% VAT</td><td>£{amount:.2f}</td></tr>'
+            
+    totals_rows += f'<tr class="bold-row"><td style="text-align:left;">Total</td><td>£{grand_total:.2f}</td></tr>'
     
     # Calculate derived invoice number safely (starts mapping at 41250)
     invoice_num = 41250 + int(order_id)
@@ -1345,18 +1476,7 @@ def print_doc():
         </table>
         
         <table class="totals-table">
-            <tr>
-                <td style="text-align:left;">Subtotal</td>
-                <td>£{subtotal:.2f}</td>
-            </tr>
-            <tr>
-                <td style="text-align:left;">5% VAT</td>
-                <td>£{vat_amount:.2f}</td>
-            </tr>
-            <tr class="bold-row">
-                <td style="text-align:left;">Total</td>
-                <td>£{grand_total:.2f}</td>
-            </tr>
+            {totals_rows}
         </table>
         
         {payment_html}
@@ -1556,13 +1676,16 @@ def save_order():
 
     for pid, data in items.items():
         qty = int(data['qty'])
-        prod_code = pid if not str(pid).isdigit() else f"SKU-{pid}" # Handle transition
-        cur.execute("INSERT INTO order_items (order_id, product_code, quantity, custom_name, custom_price) VALUES (%s,%s,%s,%s,%s)",
-                    (oid, pid, qty, data.get('custom_name'), data.get('price')))
+        tax = data.get('tax')
+        tax = float(tax) if tax is not None else None
+        prod_code = "40004" if str(pid).startswith("other_") else pid
+        
+        cur.execute("INSERT INTO order_items (order_id, product_code, quantity, custom_name, custom_price, tax_rate) VALUES (%s,%s,%s,%s,%s,%s)",
+                    (oid, prod_code, qty, data.get('custom_name'), data.get('price'), tax))
         cur.execute("""
             INSERT INTO inventory (product_code, quantity) VALUES (%s, %s)
             ON CONFLICT (product_code) DO UPDATE SET quantity = inventory.quantity + EXCLUDED.quantity
-        """, (pid, -qty))
+        """, (prod_code, -qty))
 
     conn.commit(); cur.close(); conn.close()
     return redirect(f"/lookup?phone={phone}")
@@ -1605,11 +1728,15 @@ def update_order():
             qty = int(info.get("qty", 0))
             price = float(info.get("price", 0.0))
             custom_name = info.get("custom_name")
+            tax = info.get("tax")
+            tax = float(tax) if tax is not None else None
+            
+            prod_code = "40004" if str(pid).startswith("other_") else pid
             
             cur.execute("""
-                INSERT INTO order_items (order_id, product_code, quantity, custom_price, custom_name)
-                VALUES (%s, %s, %s, %s, %s)
-            """, (order_id, pid, qty, price, custom_name))
+                INSERT INTO order_items (order_id, product_code, quantity, custom_price, custom_name, tax_rate)
+                VALUES (%s, %s, %s, %s, %s, %s)
+            """, (order_id, prod_code, qty, price, custom_name, tax))
         
         conn.commit()
     except Exception as e:
@@ -2699,13 +2826,18 @@ def cash():
         
         tiles += f'''
         <div class="product-tile" id="tile-{p["product_code"]}" style="background-color: {bg_color}; padding: 12px 8px; position:relative;" onclick="addQty('{p["product_code"]}', '{safe_name}', {p["price"]})">
-            <div class="p-name" style="font-size:1rem;">{short_name}</div>
-            <div style="font-size:0.9rem;color:var(--muted);margin-top:4px; display:flex; justify-content:center; align-items:center; gap:6px;">
-                £<span id="price-display-{p['product_code']}">{p["price"]}</span>
-                <span onclick="event.stopPropagation(); setCustomPrice('{p['product_code']}', {p['price']})" style="cursor:pointer; font-size:0.85rem;" title="Give Discount">✏️</span>
+            <div class="p-name" style="font-size:1.3rem; font-weight:700;">{short_name}</div>
+            <div style="font-size:1.1rem;color:var(--muted);margin-top:4px; display:flex; justify-content:center; align-items:center; gap:6px;">
+                £<span id="price-display-{p['product_code']}">{p['price']}</span>
+                <span onclick="event.stopPropagation(); setCustomPrice('{p['product_code']}', {p['price']})" style="cursor:pointer; font-size:0.95rem;" title="Edit Price">✏️</span>
             </div>
-            <div class="p-qty" id="qty-{p["product_code"]}" style="font-size:1.6rem; min-height:1.8rem; margin-top:6px;"></div>
-            <span style="position:absolute;top:6px;right:6px;font-size:1.2rem;color:var(--danger);display:none;cursor:pointer;background:var(--bg);border-radius:50%;width:24px;height:24px;line-height:24px;" id="reset-{p["product_code"]}" onclick="event.stopPropagation();resetTile('{p["product_code"]}')">&#x2715;</span>
+            <div id="qty-container-{p["product_code"]}" style="display:none; align-items:center; justify-content:center; gap:8px; margin-top:12px;">
+                <button type="button" style="padding:6px 12px; font-size:1.2rem; border-radius:6px; background:var(--bg); border:1px solid var(--border); color:var(--text); cursor:pointer;" onclick="event.stopPropagation(); reduceQty('{p['product_code']}')">-</button>
+                <div class="p-qty" id="qty-{p["product_code"]}" style="font-size:1.8rem; margin:0; min-width:30px;"></div>
+                <button type="button" style="padding:6px 12px; font-size:1.2rem; border-radius:6px; background:var(--bg); border:1px solid var(--border); color:var(--text); cursor:pointer;" onclick="event.stopPropagation(); addQty('{p['product_code']}', '{safe_name}', {p['price']})">+</button>
+            </div>
+            
+            <span style="position:absolute;top:6px;right:6px;font-size:1.2rem;color:var(--danger);display:none;cursor:pointer;background:var(--bg);border-radius:50%;width:24px;height:24px;line-height:24px;" id="reset-{p["product_code"]}" onclick="event.stopPropagation();resetTile('{p['product_code']}')">&#x2715;</span>
         </div>
         '''
 
@@ -2897,7 +3029,7 @@ def inventory():
     cur.close(); conn.close()
 
     table_rows = "".join(f'''
-        <tr>
+        <tr draggable="true" class="draggable-row" style="cursor: grab;">
             <td><input type="number" name="sort_{r['product_code']}" value="{r['sort_order']}" class="modern-input" style="background:var(--bg);margin:0;width:60px;padding:8px;" disabled></td>
             <td style="font-weight:bold; font-family:'DM Mono',monospace;">{r['product_code']}</td>
             <td><input type="text" name="name_{r['product_code']}" value="{r['name']}" class="modern-input" style="background:var(--bg);margin:0;padding:8px;" disabled></td>
@@ -2913,7 +3045,10 @@ def inventory():
             <td><input type="number" name="qty_{r['product_code']}" value="{r['qty']}" class="modern-input" style="background:var(--bg);margin:0;width:75px;padding:8px;" disabled></td>
             <td><input type="number" name="net_{r['product_code']}" value="{r['net']}" step="0.001" class="modern-input" style="background:var(--bg);margin:0;width:80px;padding:8px;" disabled></td>
             <td><input type="number" name="gross_{r['product_code']}" value="{r['gross']}" step="0.001" class="modern-input" style="background:var(--bg);margin:0;width:80px;padding:8px;" disabled></td>
-            <td><input type="text" name="color_{r['product_code']}" value="{r['color'] or 'var(--surface)'}" class="modern-input" style="background:var(--bg);margin:0;width:100px;padding:8px;" disabled></td>
+            
+            <!-- Changed to color picker -->
+            <td><input type="color" name="color_{r['product_code']}" value="{r['color'] if r['color'] and r['color'].startswith('#') else '#ffffff'}" class="modern-input" style="background:var(--bg);margin:0;width:60px;padding:2px; height:38px;" disabled></td>
+            
             <td style="text-align:right"><button type="submit" name="delete_pid" value="{r['product_code']}" class="btn btn-danger" style="padding:6px 12px;">Delete</button></td>
         </tr>
     ''' for r in rows)
@@ -2934,8 +3069,8 @@ def inventory():
             <div style="padding:24px;background:var(--surface);border-top:1px solid var(--border)">
                 <h3 style="margin-bottom:16px;">Add New Product</h3>
                 <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
-                    <input type="text" name="new_code" placeholder="Code/SKU" class="modern-input" style="margin:0;width:100px;" required>
-                    <input type="text" name="new_name" placeholder="Full Name" class="modern-input" style="margin:0;flex:2;" required>
+                    <input type="text" name="new_code" placeholder="Code/SKU" class="modern-input" style="margin:0;width:100px;">
+                    <input type="text" name="new_name" placeholder="Full Name" class="modern-input" style="margin:0;flex:2;">
                     <input type="text" name="new_display" placeholder="Short Name" class="modern-input" style="margin:0;flex:1;">
                     <select name="new_gas" class="modern-input" style="margin:0;flex:1;padding:12px;">
                         <option value="">No Gas Type</option>
@@ -2945,6 +3080,7 @@ def inventory():
                     <input type="number" name="new_price" placeholder="£" step="0.01" class="modern-input" style="margin:0;width:70px;">
                     <input type="number" name="new_qty" placeholder="Qty" class="modern-input" style="margin:0;width:70px;">
                     <input type="number" name="new_sort" placeholder="Sort" class="modern-input" style="margin:0;width:60px;">
+                    <input type="color" name="new_color" value="#ffffff" class="modern-input" style="margin:0;width:50px;padding:2px;height:49px;" title="Tile Color">
                     <button type="submit" class="btn btn-primary" style="height:49px;">Add</button>
                 </div>
             </div>
@@ -2955,10 +3091,48 @@ def inventory():
     </div>
     <script>
     function enableEdit(){{
-      document.querySelectorAll('input.modern-input:disabled, select.modern-input:disabled').forEach(i => {{
-          i.disabled = false; i.style.background = 'var(--surface)'; i.style.borderColor = 'var(--accent)';
-      }});
-    }} 
+        document.querySelectorAll('input.modern-input:disabled, select.modern-input:disabled').forEach(i => {{
+            i.disabled = false; i.style.background = 'var(--surface)'; i.style.borderColor = 'var(--accent)';
+        }});
+    }}
+
+    // Native Drag and Drop Logic
+    let draggedRow = null;
+    document.querySelectorAll('.draggable-row').forEach(row => {{
+        row.addEventListener('dragstart', function(e) {{
+            draggedRow = this;
+            this.style.opacity = '0.5';
+            enableEdit(); // Automatically enable saving when they start rearranging
+        }});
+        
+        row.addEventListener('dragend', function(e) {{
+            this.style.opacity = '1';
+        }});
+        
+        row.addEventListener('dragover', function(e) {{
+            e.preventDefault(); // Necessary to allow dropping
+        }});
+        
+        row.addEventListener('drop', function(e) {{
+            e.preventDefault();
+            if (draggedRow !== this) {{
+                let tbody = this.parentNode;
+                let allRows = Array.from(tbody.querySelectorAll('.draggable-row'));
+                let draggedIdx = allRows.indexOf(draggedRow);
+                let droppedIdx = allRows.indexOf(this);
+                
+                // Move the row visually
+                if (draggedIdx < droppedIdx) {{ this.after(draggedRow); }} 
+                else {{ this.before(draggedRow); }}
+                
+                // Re-calculate the sort numbers automatically
+                tbody.querySelectorAll('.draggable-row').forEach((r, index) => {{
+                    let sortInput = r.querySelector('input[name^="sort_"]');
+                    if(sortInput) sortInput.value = index + 1;
+                }});
+            }}
+        }});
+    }});
     </script>
     '''
     return page("Inventory", body, wide=True)
@@ -3108,9 +3282,12 @@ def save_walkin():
 
     for pid, data in items.items():
         qty = int(data['qty'])
-        prod_code = pid if not str(pid).isdigit() else f"SKU-{pid}"
-        cur.execute("INSERT INTO order_items (order_id, product_code, quantity, custom_name, custom_price) VALUES (%s,%s,%s,%s,%s)",
-                    (oid, prod_code, qty, data.get('custom_name'), data.get('price')))
+        tax = data.get('tax')
+        tax = float(tax) if tax is not None else None
+        prod_code = "40004" if str(pid).startswith("other_") else pid
+        
+        cur.execute("INSERT INTO order_items (order_id, product_code, quantity, custom_name, custom_price, tax_rate) VALUES (%s,%s,%s,%s,%s,%s)",
+                    (oid, prod_code, qty, data.get('custom_name'), data.get('price'), tax))
         cur.execute("""
             INSERT INTO inventory (product_code, quantity) VALUES (%s, %s)
             ON CONFLICT (product_code) DO UPDATE SET quantity = inventory.quantity + EXCLUDED.quantity
