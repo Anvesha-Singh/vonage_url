@@ -452,23 +452,6 @@ def reload_cache():
     get_all_products.cache_clear()
     return redirect(request.referrer or "/search")
 
-@app.route("/api/toggle_delivery_status", methods=["POST"])
-@login_required
-def toggle_delivery_status():
-    data = request.json
-    order_id = data.get("order_id")
-    field = data.get("field") # 'is_dispatched' or 'is_delivered'
-    value = data.get("value")
-    
-    if order_id and field in ['is_dispatched', 'is_delivered']:
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute(f"UPDATE orders SET {field} = %s WHERE id = %s", (value, order_id))
-        conn.commit()
-        cur.close(); conn.close()
-        return jsonify({"status": "success"})
-    return jsonify({"status": "error"}), 400
-
 @app.route("/roll_undelivered", methods=["POST"])
 @login_required
 def roll_undelivered():
@@ -698,6 +681,20 @@ def lookup():
     initial = (user['name'] or '?')[0].upper()
     sched = get_delivery_schedule(user.get("town"))
 
+    # Fetch any numbers linked to this account
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT phone FROM customers WHERE is_alias_for = %s", (phone,))
+    alias_rows = cur.fetchall()
+    aliases = [f"0{r['phone']}" for r in alias_rows] if alias_rows else []
+    cur.close(); conn.close()
+
+    # Build the HTML for the secondary badges
+    aliases_html = ""
+    if aliases:
+        alias_badges = "".join(f'<span class="badge" style="margin-left:6px; font-size:0.9rem; background:var(--bg); border:1px solid var(--border); color:var(--muted); padding:2px 8px;">{a}</span>' for a in aliases)
+        aliases_html = f'<div style="margin-top:8px; font-size:0.9rem; color:var(--muted);">Linked:{alias_badges}</div>'
+
     special_prices = {}
     if user.get("has_special_prices"):
         conn = get_db()
@@ -715,6 +712,8 @@ def lookup():
         if p.get('display_name'):
             p_map[p['display_name']] = pid
         d_prices[pid] = float(p['price'])
+
+    user_email = user.get('email', '') if user and 'email' in user else ''
 
     order_cards = ""
     for o in orders[:5]:
@@ -736,6 +735,9 @@ def lookup():
             <div style="margin-top:8px; display:flex; justify-content:flex-end; gap:8px;">
                 <button type="button" class="btn btn-ghost" style="padding:4px 8px;font-size:0.8rem; color:var(--text);" onclick="openPrintModal('{o["id"]}', 'Invoice')">📄 Inv</button>
                 <button type="button" class="btn btn-ghost" style="padding:4px 8px;font-size:0.8rem; color:var(--text);" onclick="openPrintModal('{o["id"]}', 'Receipt')">🧾 Rec</button>
+                
+                <!-- Updated to trigger the dynamic Email Modal -->
+                <button type="button" class="btn btn-ghost" style="padding:4px 8px;font-size:0.8rem; color:var(--text);" onclick="openEmailModal('{o["id"]}')">✉️ Email</button>
                 
                 <button type="button" class="btn btn-ghost" style="padding:4px 8px;font-size:0.8rem; color:var(--accent);" onclick="editOrder('{o["id"]}')">✏️ Edit</button>
                 <form method="POST" action="/delete_order" style="margin:0;">
@@ -788,9 +790,11 @@ def lookup():
                     <div>
                         <h2 style="font-size:1.4rem;">{user["name"]}</h2>
                         <div class="badge" style="margin-left:0; margin-top:4px; font-size:1rem;">0{phone}</div>
+                        {aliases_html}
                     </div>
                 </div>
                 <div style="font-size:1rem;color:var(--muted);font-family:'DM Mono',monospace; line-height:1.4;">
+                    {user.get("email","") + '<br>' if user.get("email") else ''}
                     {user.get("address","")}<br>{user.get("town","")}<br>{user.get("postcode","")}
                 </div>
                 <div style="color:var(--accent);font-weight:bold;font-size:0.95rem;">🚚 Days: {sched}</div>
@@ -900,8 +904,33 @@ def lookup():
         </div>
     </div>
 
+    <div id="email-modal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.6); z-index:1000; align-items:center; justify-content:center; backdrop-filter:blur(3px);">
+        <div class="card" style="width:100%; max-width:350px; box-shadow: 0 10px 25px rgba(0,0,0,0.5);">
+            <h3 style="margin-top:0;">Send Email</h3>
+            <input type="hidden" id="email-order-id">
+            
+            <label style="display:block; font-size:0.9rem; margin-bottom:4px; color:var(--muted);">Document Type</label>
+            <select id="email-type" class="modern-input">
+                <option value="Invoice">Invoice</option>
+                <option value="Receipt">Receipt</option>
+            </select>
+            
+            <label style="display:block; font-size:0.9rem; margin-top:12px; margin-bottom:4px; color:var(--muted);">Document Date</label>
+            <input type="date" id="email-date" class="modern-input" value="{datetime.today().date()}">
+            
+            <label style="display:block; font-size:0.9rem; margin-top:12px; margin-bottom:4px; color:var(--muted);">Due Date (If Invoice)</label>
+            <input type="date" id="email-due" class="modern-input" value="{datetime.today().date()}">
+            
+            <div style="display:flex; gap:12px; justify-content:flex-end; margin-top:20px;">
+                <button type="button" class="btn btn-ghost" onclick="document.getElementById('email-modal').style.display='none'">Cancel</button>
+                <button type="button" class="btn btn-primary" onclick="submitEmailModal()">Draft & Download</button>
+            </div>
+        </div>
+    </div>
+
     <script>
     const currentPhone = "{phone}";
+    const userEmailStr = "{user_email}"; 
     let items = {{}};
     let total = 0.0;
     let pendingOtherId = null;
@@ -913,26 +942,58 @@ def lookup():
 
     function openPrintModal(orderId, type) {{
         let o = recentOrders[orderId];
-        
-        // Grab the original order date to prefill the modal (fallback to today)
         let oDate = o && o.date ? o.date.toString().substring(0, 10) : document.getElementById('print-date').defaultValue;
-
         document.getElementById('print-order-id').value = orderId;
         document.getElementById('print-type').value = type;
         document.getElementById('print-title').innerText = "Print " + type;
-        
-        // Auto-fill the dates with the order date
         document.getElementById('print-date').value = oDate;
         document.getElementById('print-due').value = oDate;
-        
         document.getElementById('print-modal').style.display = 'flex';
+    }}
+
+    function submitPrintModal() {{
+        let oid = document.getElementById('print-order-id').value;
+        let type = document.getElementById('print-type').value;
+        let date = document.getElementById('print-date').value;
+        let due = document.getElementById('print-due').value;
+        document.getElementById('print-modal').style.display = 'none';
+        window.open(`/print_doc?order_id=${{oid}}&type=${{type}}&date=${{date}}&due=${{due}}`, '_blank');
+    }}
+
+    function openEmailModal(orderId) {{
+        let o = recentOrders[orderId];
+        let oDate = o && o.date ? o.date.toString().substring(0, 10) : document.getElementById('email-date').defaultValue;
+        document.getElementById('email-order-id').value = orderId;
+        document.getElementById('email-date').value = oDate;
+        document.getElementById('email-due').value = oDate;
+        document.getElementById('email-modal').style.display = 'flex';
+    }}
+
+    function submitEmailModal() {{
+        let oid = document.getElementById('email-order-id').value;
+        let type = document.getElementById('email-type').value;
+        let date = document.getElementById('email-date').value;
+        let due = document.getElementById('email-due').value;
+        document.getElementById('email-modal').style.display = 'none';
+        
+        let subject = type === "Invoice" ? "Gas Invoice - Sleemans" : "Gas Receipt - Sleemans";
+        let rawBody = `Hi there,\n\nThank you for placing an order with Sleemans. Please find the ${{type.toLowerCase()}} for your order attached below.\n\nRegards,\nSleemans Trading Ltd`;
+        let outlookWebUrl = `https://outlook.office.com/mail/deeplink/compose?to=${{encodeURIComponent(userEmailStr)}}&subject=${{encodeURIComponent(subject)}}&body=${{encodeURIComponent(rawBody)}}`;
+        
+        window.open(outlookWebUrl, '_blank');
+        
+        setTimeout(() => {{
+            let pdfTab = window.open(`/print_doc?order_id=${{oid}}&type=${{type}}&date=${{date}}&due=${{due}}`, '_blank');
+            if (!pdfTab) {{
+                alert("Your browser blocked the Invoice popup! Please check the address bar for the 'Popup Blocked' icon and select 'Always allow popups from this site'.");
+            }}
+        }}, 400);
     }}
 
     function reduceQty(id) {{
         if(!items[id]) return;
         items[id].qty -= 1;
         total -= items[id].price;
-        
         if(items[id].qty <= 0) {{
             resetTile(id);
         }} else {{
@@ -945,8 +1006,6 @@ def lookup():
         let n = document.getElementById('other-name').value.trim();
         let p = parseFloat(document.getElementById('other-price').value);
         let t = parseFloat(document.getElementById('other-tax').value) || 5; 
-        
-        // We hardcode quantity to 1 and remove the broken getElementById!
         let q = 1; 
         
         if(!n || isNaN(p)) {{
@@ -955,7 +1014,6 @@ def lookup():
         }}
         
         let id = 'other_' + Date.now();
-        // Add tax to the dictionary so Python receives it
         items[id] = {{qty: q, price: p, custom_name: n, tax: t}}; 
         total += p;
         
@@ -984,19 +1042,18 @@ def lookup():
     }}
 
     function executeAdd(id, name, price) {{
-        // Stop it from re-prompting if we click + on an existing custom tile
         let cPrice = customPrices[id] !== undefined ? customPrices[id] : price;
         if(items[id] && items[id].price !== undefined && name === 'Other_Existing') cPrice = items[id].price;
         
         let cName = items[id] ? items[id].custom_name : null;
+        let cTax = items[id] ? items[id].tax : null; 
         
-        if(!items[id]) items[id] = {{qty:0, price: cPrice, custom_name: cName}};
+        if(!items[id]) items[id] = {{qty:0, price: cPrice, custom_name: cName, tax: cTax}};
         items[id].qty += 1;
         total += cPrice;
         
         document.getElementById("qty-"+id).textContent = items[id].qty;
         
-        // Show the +/- container instead of just text
         let container = document.getElementById("qty-container-"+id);
         if(container) container.style.display = "flex";
         
@@ -1013,41 +1070,28 @@ def lookup():
         if(items[id]) total -= (items[id].price * items[id].qty);
         delete items[id];
         
-        // If it's a dynamic 'Other' tile, destroy it completely
         if(id.toString().startsWith('other_')) {{
             let el = document.getElementById('tile-'+id);
             if(el) el.remove();
         }} else {{
-            // Otherwise just hide the UI for standard catalog items
-            document.getElementById("qty-"+id).textContent="";
+            let qtyEl = document.getElementById("qty-"+id);
+            if(qtyEl) qtyEl.textContent="";
             let container = document.getElementById("qty-container-"+id);
             if(container) container.style.display = "none";
-            document.getElementById("tile-"+id).classList.remove("selected");
-            document.getElementById("reset-"+id).style.display = "none";
+            let tile = document.getElementById("tile-"+id);
+            if(tile) tile.classList.remove("selected");
+            let resetBtn = document.getElementById("reset-"+id);
+            if(resetBtn) resetBtn.style.display = "none";
         }}
         document.getElementById("live-total").innerText = Math.max(0, total).toFixed(2);
     }}
 
-    function submitPrintModal() {{
-        let oid = document.getElementById('print-order-id').value;
-        let type = document.getElementById('print-type').value;
-        let date = document.getElementById('print-date').value;
-        let due = document.getElementById('print-due').value;
-        
-        document.getElementById('print-modal').style.display = 'none';
-        
-        // Open the printable document in a new tab so they don't lose their place
-        window.open(`/print_doc?order_id=${{oid}}&type=${{type}}&date=${{date}}&due=${{due}}`, '_blank');
-    }}
-
     function cancelEdit() {{
         for (let id in items) {{
-            // If it's a dynamic 'Other' tile, destroy it completely
             if(id.toString().startsWith('other_')) {{
                 let tile = document.getElementById("tile-"+id);
                 if(tile) tile.remove();
             }} else {{
-                // Otherwise just reset standard catalog items
                 let qtyEl = document.getElementById("qty-"+id);
                 if(qtyEl) qtyEl.textContent = "";
                 let tileEl = document.getElementById("tile-"+id);
@@ -1074,7 +1118,6 @@ def lookup():
         
         let saveBtn = document.getElementById('save-btn');
         saveBtn.innerText = "Save & Confirm Order";
-        // Clear the inline styles so it falls back to your native CSS btn-primary class!
         saveBtn.style.background = ""; 
         saveBtn.style.color = "";
         document.getElementById('cancel-edit-btn').style.display = 'none';
@@ -1095,11 +1138,9 @@ def lookup():
                 if (!id) return; 
 
                 let pName = i.custom_name || i.product;
-                // Safely parse as floats just to be absolutely sure
                 let pPrice = parseFloat(i.price) || 0;
                 let pTax = parseFloat(i.tax_rate) || 5;
 
-                // Force to string so it matches whether the DB sends a number or string!
                 if (id.toString() === '40004') {{
                     id = 'other_' + Date.now() + Math.floor(Math.random() * 1000);
                     let grid = document.querySelector('.product-grid');
@@ -1122,12 +1163,10 @@ def lookup():
                     grid.appendChild(div);
                 }}
 
-                // Save the tax to the global items dictionary so it goes back to the DB on save!
                 items[id] = {{qty: i.qty, price: pPrice, custom_name: pName, tax: pTax}};
                 total += (pPrice * i.qty);
 
                 let qtyEl = document.getElementById("qty-"+id);
-                // Only trigger the UI updates below if it's a standard inventory item
                 if(qtyEl && !id.toString().startsWith('other_')) {{
                     qtyEl.textContent = items[id].qty;
                     let container = document.getElementById("qty-container-"+id);
@@ -1158,7 +1197,6 @@ def lookup():
     async function setCustomPrice(id, defaultPrice) {{
         let current = customPrices[id] !== undefined ? customPrices[id] : defaultPrice;
         let newPriceStr = prompt("Enter special permanent price (£) for this customer:", current);
-        
         if(newPriceStr === null || newPriceStr.trim() === "") return;
         let newP = parseFloat(newPriceStr);
         if(isNaN(newP) || newP < 0) return alert("Invalid price.");
@@ -1229,17 +1267,14 @@ def lookup():
             let form = document.createElement('form');
             form.method = 'POST';
             form.action = '/quick_alias';
-            
             let mInput = document.createElement('input');
             mInput.type = 'hidden';
             mInput.name = 'master_phone';
             mInput.value = masterPhone;
-            
             let aInput = document.createElement('input');
             aInput.type = 'hidden';
             aInput.name = 'new_alias';
             aInput.value = alias;
-            
             form.appendChild(mInput);
             form.appendChild(aInput);
             document.body.appendChild(form);
@@ -1803,7 +1838,12 @@ def deliveries():
             </td>
             <td>{r['address']}<br>{r['town']}, {r['postcode']}</td>
             <td style="font-weight:bold; color:var(--text);">{r['items']}</td>
-            <td style="text-align:center; font-weight:bold; font-size:12pt;">{"<span style='color:var(--success)'>✓</span>" if r['is_paid'] else ""}</td>
+            
+            <!-- Changed to an interactive Checkbox -->
+            <td class="no-print" style="text-align:center;">
+                <input type="checkbox" class="checkbox-lg" {"checked" if r['is_paid'] else ""} onchange="toggleStatus({r['id']}, 'is_paid', this.checked)">
+            </td>
+            
             <td>{r['notes'] or ''}</td>
             <td class="no-print" style="text-align:center;">
                 <input type="checkbox" class="checkbox-lg" {"checked" if r['is_delivered'] else ""} onchange="toggleStatus({r['id']}, 'is_delivered', this.checked)">
@@ -2097,6 +2137,23 @@ def deliveries():
     '''
     return page(f"Deliveries {target_date}", body, wide=True)
 
+@app.route("/api/toggle_delivery_status", methods=["POST"])
+@login_required
+def toggle_delivery_status():
+    data = request.json
+    order_id = data.get("order_id")
+    field = data.get("field") # Added 'is_paid' to the allowed list below
+    value = data.get("value")
+    
+    if order_id and field in ['is_dispatched', 'is_delivered', 'is_paid']:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute(f"UPDATE orders SET {field} = %s WHERE id = %s", (value, order_id))
+        conn.commit()
+        cur.close(); conn.close()
+        return jsonify({"status": "success"})
+    return jsonify({"status": "error"}), 400
+
 @app.route("/export_delivery_excel")
 @login_required
 def export_delivery_excel():
@@ -2382,18 +2439,20 @@ def add_customer():
     if request.method == "POST":
         phone = clean_phone(request.form.get("phone"))
         name  = request.form.get("name")
+        email = request.form.get("email") # Capture the email
         address = request.form.get("address")
         town = request.form.get("town")
         postcode = request.form.get("postcode")
 
         conn = get_db()
         cur = conn.cursor()
+        
         cur.execute("""
-            INSERT INTO customers (phone, name, address, town, postcode)
-            VALUES (%s,%s,%s,%s,%s)
+            INSERT INTO customers (phone, name, email, address, town, postcode)
+            VALUES (%s,%s,%s,%s,%s,%s)
             ON CONFLICT (phone) DO UPDATE
-            SET name=EXCLUDED.name, address=EXCLUDED.address, town=EXCLUDED.town, postcode=EXCLUDED.postcode
-        """, (phone,name,address,town,postcode))
+            SET name=EXCLUDED.name, email=EXCLUDED.email, address=EXCLUDED.address, town=EXCLUDED.town, postcode=EXCLUDED.postcode
+        """, (phone, name, email, address, town, postcode))
         conn.commit()
         cur.close(); conn.close()
 
@@ -2412,6 +2471,10 @@ def add_customer():
             <div style="margin-bottom:16px">
                 <label style="display:block;font-weight:bold;color:var(--muted);margin-bottom:8px;">Full Name</label>
                 <input type="text" name="name" class="modern-input">
+            </div>
+            <div style="margin-bottom:16px">
+                <label style="display:block;font-weight:bold;color:var(--muted);margin-bottom:8px;">Email Address</label>
+                <input type="email" name="email" class="modern-input">
             </div>
             <div style="margin-bottom:16px">
                 <label style="display:block;font-weight:bold;color:var(--muted);margin-bottom:8px;">Street Address</label>
@@ -2446,12 +2509,13 @@ def edit_customer():
 
         conn = get_db()
         cur = conn.cursor()
+        
         cur.execute('''
             UPDATE customers
-            SET name=%s, address=%s, town=%s, postcode=%s
+            SET name=%s, email=%s, address=%s, town=%s, postcode=%s
             WHERE phone=%s
         ''', (
-            request.form.get("name"), request.form.get("address"),
+            request.form.get("name"), request.form.get("email"), request.form.get("address"),
             request.form.get("town"), request.form.get("postcode"), phone
         ))
         conn.commit()
@@ -2459,6 +2523,8 @@ def edit_customer():
         return redirect(f"/lookup?phone={phone}")
 
     user = get_customer(phone)
+    # Safely fetch email
+    user_email = user.get('email', '') if user and 'email' in user else ''
 
     body = f'''
     <h1>Edit Customer</h1>
@@ -2471,6 +2537,10 @@ def edit_customer():
         <div style="margin-bottom:16px">
             <label style="display:block;font-weight:bold;color:var(--muted);margin-bottom:8px;">Full Name</label>
             <input type="text" name="name" value="{user.get('name','')}" class="modern-input">
+        </div>
+        <div style="margin-bottom:16px">
+            <label style="display:block;font-weight:bold;color:var(--muted);margin-bottom:8px;">Email Address</label>
+            <input type="email" name="email" value="{user_email}" class="modern-input">
         </div>
         <div style="margin-bottom:16px">
             <label style="display:block;font-weight:bold;color:var(--muted);margin-bottom:8px;">Street Address</label>
